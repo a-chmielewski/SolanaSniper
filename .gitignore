@@ -1,0 +1,21 @@
+/.cursor
+/config.json
+/logs
+/venv
+/performance
+/sessions
+/.pytest_cache
+/test_sessions
+/strategies/High-Volatility Market Strategies - BACKTEST
+/strategies/Low-Volatility Market Strategies - BACKTEST/
+/strategies/Ranging Market Strategies - BACKTEST/
+/strategies/Transitional Market Strategies - BACKTEST
+/strategies/Trending Market Strategies - BACKTEST/
+/strategies/Missing Strategies - BACKTEST/
+*.json
+/__pycache__
+/modules/__pycache__
+*.pyc
+implementation_plan.md
+MODULE_IMPLEMENTATION_PLAN.md
+FIX TO DO LATER.txt
