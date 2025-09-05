@@ -1,4 +1,5 @@
 # API Keys
+BIRDEYE_API_KEY = ""  # Add your BirdEye API key here
 WALLET_PRIVATE_KEY = "your-wallet-private-key"
 
 # Strategy thresholds
