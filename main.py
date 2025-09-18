@@ -23,7 +23,7 @@ class SolanaSniper:
     def __init__(self):
         self.running = False
         self.wallet = None
-        self.scan_interval = 30
+        self.scan_interval = 60  # Increased to 60s to reduce API calls
         signal.signal(signal.SIGINT, self._signal_handler)
     
     def _signal_handler(self, signum, frame):
@@ -75,13 +75,15 @@ class SolanaSniper:
         
         try:
             signal_strength = sniper_strategy.get_entry_signals(token_data)
+            token_data['signal_strength'] = signal_strength  # Store for logging
             should_buy, reason = sniper_strategy.should_buy(token_data)
             
             if should_buy:
-                sniper_logger.log_info(f"✅ Buy signal: {token_symbol}")
+                sniper_logger.log_info(f"✅ Buy signal: {token_symbol} (Signal: {signal_strength}/100)")
+                sniper_logger.log_market_opportunity(token_symbol, signal_strength, reason)
                 self.execute_buy(token_data)
             else:
-                sniper_logger.log_info(f"❌ Skip: {token_symbol} - {reason}")
+                sniper_logger.log_info(f"❌ Skip: {token_symbol} - {reason} (Signal: {signal_strength}/100)")
         except Exception as e:
             sniper_logger.log_error(f"Error evaluating {token_symbol}: {str(e)}")
     
@@ -182,10 +184,10 @@ class SolanaSniper:
     def stop(self):
         if not self.running:
             return
-        
+
         sniper_logger.log_info("🛑 Stopping bot...")
         self.running = False
-        
+
         try:
             self.print_status()
             sniper_logger.print_session_summary()
@@ -194,6 +196,8 @@ class SolanaSniper:
             sniper_logger.log_success("✅ Bot stopped gracefully")
         except Exception as e:
             sniper_logger.log_error(f"Shutdown error: {str(e)}")
+        finally:
+            sys.exit(0)
 
 def main():
     print("🎯 Solana Sniper Bot v1.0")

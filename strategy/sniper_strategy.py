@@ -19,6 +19,10 @@ class SniperStrategy:
         if not self._basic_safety_checks(token_data):
             return False, "Failed basic safety checks"
         
+        # Security checks via BirdEye
+        if not self._check_token_security(token_data):
+            return False, "Failed security checks"
+        
         # Check liquidity depth
         if not self._check_liquidity_depth(token_data):
             return False, "Insufficient liquidity depth"
@@ -170,6 +174,38 @@ class SniperStrategy:
                 return True, "low_activity"
         
         return False, "hold"
+    
+    def _check_token_security(self, token_data):
+        """Check token security via BirdEye"""
+        token_address = token_data.get('address')
+        if not token_address:
+            return False
+        
+        try:
+            security_data = birdeye_api.get_token_security(token_address)
+            if not security_data:
+                return True  # If no data, don't block (might be new token)
+            
+            # Check for honeypot flags
+            if security_data.get('is_honeypot', False):
+                return False
+            
+            # Check for suspicious flags
+            if security_data.get('is_scam', False):
+                return False
+            
+            # Check contract verification
+            if security_data.get('is_verified') == False:
+                return False
+            
+            # Check for mint/freeze authority (risky if enabled)
+            if security_data.get('can_mint', True) or security_data.get('can_freeze', True):
+                return False
+            
+            return True
+            
+        except Exception:
+            return True  # Don't block on API errors
     
     def calculate_position_size(self, wallet_balance, token_data):
         """Calculate appropriate position size"""

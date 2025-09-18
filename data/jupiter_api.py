@@ -71,10 +71,10 @@ class JupiterAPI:
         except Exception:
             return None
 
-    def get_token_to_sol_quote(self, token_mint, token_amount, token_decimals=9, slippage_bps=50):
+    def get_token_to_sol_quote(self, token_mint, token_amount, token_decimals, slippage_bps=50):
         """Get quote for token to SOL swap"""
-        # Convert token amount based on decimals
-        token_units = int(token_amount * (10 ** token_decimals))
+        # Convert token amount based on actual token decimals
+        token_units = int(token_amount * (10 ** int(token_decimals)))
         return self.get_quote(token_mint, SOL_MINT, token_units, slippage_bps)
 
     def get_swap_transaction(self, quote_response, user_public_key):

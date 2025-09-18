@@ -20,6 +20,10 @@ class TradeManager:
         if not self.wallet.get_address():
             return {"error": "Wallet not loaded"}
         
+        # Check for existing position
+        if token_address in self.active_positions:
+            return {"error": f"Already have position in {token_symbol}"}
+        
         # Check SOL balance and calculate required amount
         sol_balance = self.wallet.get_sol_balance()
         
@@ -55,7 +59,7 @@ class TradeManager:
             if result.get('error'):
                 return result
             
-            # Get token decimals for accurate tracking
+            # Get token decimals from BirdEye data
             token_decimals = token_data.get('decimals', 9)
             
             # Record position
@@ -96,7 +100,7 @@ class TradeManager:
             if token_balance <= 0:
                 return {"error": "No tokens to sell"}
             
-            # Get token decimals from position data
+            # Get token decimals from position data (stored from buy)
             token_decimals = position.get('token_decimals', 9)
             
             # Get quote for token to SOL using correct decimals
@@ -126,19 +130,21 @@ class TradeManager:
             # Calculate P&L
             current_price = birdeye_api.get_price(token_address) or 0
             entry_price = position['entry_price']
-            pnl_percent = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
             
             # Update position
-            position['exit_time'] = datetime.now()
-            position['exit_price'] = current_price
-            position['pnl_percent'] = pnl_percent
-            position['exit_reason'] = reason
-            position['status'] = 'closed'
-            position['sell_tx_id'] = result.get('tx_id')
+            position.update({
+                'exit_time': datetime.now(),
+                'exit_price': current_price,
+                'pnl_percent': pnl_percent,
+                'exit_reason': reason,
+                'status': 'closed',
+                'sell_tx_id': result.get('tx_id')
+            })
             
-            # Remove from active positions
-            del self.active_positions[token_address]
+            # Move to history and remove from active
             self.trade_history.append({**position, 'action': 'sell'})
+            del self.active_positions[token_address]
             
             print(f"✅ Sold {token_symbol}: {pnl_percent:+.2f}% P&L")
             return {"success": True, "position": position}
@@ -146,99 +152,77 @@ class TradeManager:
         except Exception as e:
             return {"error": f"Sell execution failed: {str(e)}"}
     
-    def monitor_positions(self):
-        """Monitor active positions for exit conditions"""
-        positions_to_close = []
-        
-        for token_address, position in self.active_positions.items():
-            try:
-                current_price = birdeye_api.get_price(token_address)
-                if not current_price:
-                    continue
-                
-                entry_price = position['entry_price']
-                if entry_price <= 0:
-                    continue
-                
-                pnl_percent = (current_price - entry_price) / entry_price
-                
-                # Check profit target
-                if pnl_percent >= TARGET_PROFIT:
-                    positions_to_close.append((token_address, "profit_target"))
-                    continue
-                
-                # Check stop loss
-                if pnl_percent <= -STOP_LOSS:
-                    positions_to_close.append((token_address, "stop_loss"))
-                    continue
-                
-                # Check time-based exit (30 minutes max hold)
-                time_held = (datetime.now() - position['entry_time']).total_seconds() / 60
-                if time_held > 30:
-                    positions_to_close.append((token_address, "time_limit"))
-                    continue
-                
-                # Check liquidity drop (rug protection)
-                token_overview = birdeye_api.get_token_overview(token_address)
-                current_liquidity = token_overview.get('liquidity', 0)
-                if current_liquidity < 5000:  # Less than $5k liquidity
-                    positions_to_close.append((token_address, "liquidity_drop"))
-                
-            except Exception as e:
-                print(f"Error monitoring {position.get('token_symbol', token_address)}: {e}")
-        
-        # Execute sells for positions that need closing
-        results = []
-        for token_address, reason in positions_to_close:
-            result = self.execute_sniper_sell(token_address, reason)
-            results.append(result)
-        
-        return results
+    def get_active_positions(self):
+        """Get list of active positions"""
+        return list(self.active_positions.values())
+    
+    def get_position_by_address(self, token_address):
+        """Get specific position by token address"""
+        return self.active_positions.get(token_address)
     
     def get_portfolio_summary(self):
-        """Get current portfolio status"""
-        sol_balance = self.wallet.get_sol_balance()
-        active_count = len(self.active_positions)
+        """Get portfolio summary statistics"""
+        active_positions = len(self.active_positions)
         
-        total_pnl = 0
-        for trade in self.trade_history:
-            if trade.get('action') == 'sell' and 'pnl_percent' in trade:
-                total_pnl += trade['pnl_percent']
+        # Calculate total P&L from closed positions
+        closed_trades = [t for t in self.trade_history if t.get('action') == 'sell']
+        total_pnl_percent = sum(t.get('pnl_percent', 0) for t in closed_trades)
+        avg_pnl = total_pnl_percent / len(closed_trades) if closed_trades else 0
+        
+        # Get current SOL balance
+        sol_balance = self.wallet.get_sol_balance() if self.wallet else 0
         
         return {
             'sol_balance': sol_balance,
-            'active_positions': active_count,
+            'active_positions': active_positions,
             'total_trades': len([t for t in self.trade_history if t.get('action') == 'buy']),
-            'total_pnl_percent': total_pnl,
-            'wallet_address': self.wallet.get_address()
+            'total_pnl_percent': total_pnl_percent,
+            'avg_pnl_percent': avg_pnl,
+            'win_rate': self._calculate_win_rate()
         }
     
-    def get_active_positions(self):
-        """Get list of active positions with current P&L"""
-        positions_with_pnl = []
+    def _calculate_win_rate(self):
+        """Calculate win rate from closed positions"""
+        closed_trades = [t for t in self.trade_history if t.get('action') == 'sell']
+        if not closed_trades:
+            return 0
         
-        for token_address, position in self.active_positions.items():
-            current_price = birdeye_api.get_price(token_address) or 0
-            entry_price = position['entry_price']
-            
-            current_pnl = 0
-            if entry_price > 0:
-                current_pnl = (current_price - entry_price) / entry_price * 100
-            
-            position_copy = position.copy()
-            position_copy['current_price'] = current_price
-            position_copy['current_pnl_percent'] = current_pnl
-            positions_with_pnl.append(position_copy)
-        
-        return positions_with_pnl
+        winning_trades = len([t for t in closed_trades if t.get('pnl_percent', 0) > 0])
+        return (winning_trades / len(closed_trades)) * 100
+    
+    def close_all_positions(self, reason="shutdown"):
+        """Close all active positions"""
+        results = []
+        for token_address in list(self.active_positions.keys()):
+            result = self.execute_sniper_sell(token_address, reason)
+            results.append(result)
+        return results
+    
+    def get_trade_history(self, limit=None):
+        """Get trade history with optional limit"""
+        history = sorted(self.trade_history, key=lambda x: x.get('entry_time', datetime.min), reverse=True)
+        return history[:limit] if limit else history
 
-# Global instance
+# Global trade manager instance
 trade_manager = TradeManager()
 
-def execute_sniper_trade(token_data):
+# Legacy functions for backward compatibility
+def execute_buy(token_data):
     """Legacy function for backward compatibility"""
     return trade_manager.execute_sniper_buy(token_data)
 
-def monitor_position(token_address, entry_price):
+def execute_sell(token_address, reason="manual"):
     """Legacy function for backward compatibility"""
-    return trade_manager.monitor_positions()
+    return trade_manager.execute_sniper_sell(token_address, reason)
+
+def get_active_positions():
+    """Legacy function for backward compatibility"""
+    return trade_manager.get_active_positions()
+
+def get_portfolio_summary():
+    """Legacy function for backward compatibility"""
+    return trade_manager.get_portfolio_summary()
+
+def close_position(token_address, reason="manual"):
+    """Legacy function for backward compatibility"""
+    return trade_manager.execute_sniper_sell(token_address, reason)

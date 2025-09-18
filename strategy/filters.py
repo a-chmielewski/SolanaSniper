@@ -27,7 +27,7 @@ def apply_filters(raw_tokens):
 
 def get_new_tokens_only():
     """Get only newly created tokens from trending list"""
-    trending = birdeye_api.get_trending_tokens(limit=100)
+    trending = birdeye_api.get_trending_tokens(limit=20)
     if not trending:
         return []
     
@@ -41,7 +41,7 @@ def get_new_tokens_only():
 
 def get_high_volume_tokens():
     """Get tokens with recent high volume spikes"""
-    trending = birdeye_api.get_trending_tokens(limit=50)
+    trending = birdeye_api.get_trending_tokens(limit=20)
     if not trending:
         return []
     
@@ -74,7 +74,7 @@ def get_sniper_candidates():
     print("🔍 Scanning for sniper candidates...")
     
     # Get tokens from multiple sources
-    trending_tokens = birdeye_api.get_trending_tokens(limit=100) or []
+    trending_tokens = birdeye_api.get_trending_tokens(limit=20) or []  # Max limit is 20
     
     # Apply main filters
     candidates = apply_filters(trending_tokens)

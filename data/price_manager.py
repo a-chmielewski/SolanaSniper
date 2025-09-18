@@ -11,8 +11,8 @@ class PriceManager:
     def __init__(self):
         self.sol_price_cache = None
         self.sol_price_timestamp = None
-        self.cache_duration = 60  # Cache SOL price for 60 seconds
-        self.fallback_sol_price = 100.0  # Fallback if all methods fail
+        self.cache_duration = 300  # Cache SOL price for 5 minutes to reduce API calls
+        self.fallback_sol_price = 150.0  # Updated fallback closer to current SOL price
     
     def get_current_sol_price(self):
         """Get current SOL price in USD with caching"""
