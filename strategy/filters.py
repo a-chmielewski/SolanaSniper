@@ -86,21 +86,24 @@ def get_sniper_candidates():
     # Additional filtering for momentum
     momentum_candidates = filter_by_momentum(candidates)
     
-    # Combine and deduplicate
+    # Combine and deduplicate, excluding already held positions
+    from execution.trade_manager import trade_manager
     final_candidates = []
     seen_addresses = set()
     
     # Prioritize momentum candidates
     for token in momentum_candidates:
-        if token['address'] not in seen_addresses:
+        token_address = token['address']
+        if token_address not in seen_addresses and token_address not in trade_manager.active_positions:
             final_candidates.append(token)
-            seen_addresses.add(token['address'])
+            seen_addresses.add(token_address)
     
     # Add remaining candidates
     for token in candidates:
-        if token['address'] not in seen_addresses and len(final_candidates) < 5:
+        token_address = token['address']
+        if token_address not in seen_addresses and token_address not in trade_manager.active_positions and len(final_candidates) < 5:
             final_candidates.append(token)
-            seen_addresses.add(token['address'])
+            seen_addresses.add(token_address)
     
     print(f"✅ Found {len(final_candidates)} sniper candidates")
     return final_candidates[:5]  # Top 5 candidates

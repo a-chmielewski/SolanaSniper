@@ -89,8 +89,14 @@ class SolanaSniper:
     
     def execute_buy(self, token_data):
         token_symbol = token_data.get('symbol', 'UNKNOWN')
+        token_address = token_data.get('address')
         
         try:
+            # Check for duplicate position
+            if token_address in trade_manager.active_positions:
+                sniper_logger.log_warning(f"🚧 Already holding {token_symbol}, skipping duplicate buy")
+                return
+            
             active_count = len(trade_manager.get_active_positions())
             if active_count >= 5:
                 sniper_logger.log_warning("Position limit reached")
@@ -110,28 +116,18 @@ class SolanaSniper:
     
     def monitor_positions(self):
         try:
-            positions = trade_manager.get_active_positions()
-            if not positions:
-                return
-            
-            for position in positions:
-                should_sell, reason = sniper_strategy.should_sell(position)
-                if should_sell:
-                    self.execute_sell(position['token_address'], reason)
+            results = trade_manager.monitor_positions()
+            for result in results:
+                if result.get('success'):
+                    position = result['position']
+                    token_symbol = position.get('token_symbol', 'UNKNOWN')
+                    pnl = position.get('pnl_percent', 0)
+                    sniper_logger.log_success(f"Sold {token_symbol}: {pnl:+.2f}%")
+                    sniper_logger.log_trade('sell', {'symbol': token_symbol}, position)
+                elif result.get('error'):
+                    sniper_logger.log_error(f"Sell failed: {result['error']}")
         except Exception as e:
             sniper_logger.log_error(f"Position monitoring failed: {str(e)}")
-    
-    def execute_sell(self, token_address, reason):
-        try:
-            result = trade_manager.execute_sniper_sell(token_address, reason)
-            if result.get('success'):
-                position = result['position']
-                token_symbol = position.get('token_symbol', 'UNKNOWN')
-                pnl = position.get('pnl_percent', 0)
-                sniper_logger.log_success(f"Sold {token_symbol}: {pnl:+.2f}%")
-                sniper_logger.log_trade('sell', {'symbol': token_symbol}, position)
-        except Exception as e:
-            sniper_logger.log_error(f"Execute sell failed: {str(e)}")
     
     def print_status(self):
         try:
@@ -145,6 +141,10 @@ class SolanaSniper:
             print(f"SOL Price: ${sol_price:.2f}")
             print(f"SOL Balance: {portfolio['sol_balance']:.4f} (~${usd_balance:.2f})")
             print(f"Active Positions: {portfolio['active_positions']}")
+            if portfolio.get('pending_positions', 0) > 0:
+                print(f"Pending Positions: {portfolio['pending_positions']}")
+            if portfolio.get('failed_positions', 0) > 0:
+                print(f"Failed Positions: {portfolio['failed_positions']}")
             print(f"Total P&L: {portfolio['total_pnl_percent']:+.2f}%")
             print("="*50)
         except Exception as e:

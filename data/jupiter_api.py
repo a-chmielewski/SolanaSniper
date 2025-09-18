@@ -34,7 +34,7 @@ class JupiterAPI:
             print(f"Jupiter request failed: {e}")
             return None
 
-    def get_quote(self, input_mint, output_mint, amount, slippage_bps=50):
+    def get_quote(self, input_mint, output_mint, amount, slippage_bps=100):
         """Get swap quote from Jupiter aggregator"""
         params = {
             'inputMint': input_mint,

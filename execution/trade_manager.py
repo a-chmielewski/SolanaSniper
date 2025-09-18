@@ -59,10 +59,14 @@ class TradeManager:
             if result.get('error'):
                 return result
             
+            tx_id = result.get('tx_id')
+            if not tx_id:
+                return {"error": "No transaction ID returned"}
+            
             # Get token decimals from BirdEye data
             token_decimals = token_data.get('decimals', 9)
             
-            # Record position
+            # Record position with pending status
             position = {
                 'token_address': token_address,
                 'token_symbol': token_symbol,
@@ -73,19 +77,142 @@ class TradeManager:
                 'sol_price_at_entry': pricing_info['sol_price_used'],
                 'usd_amount': BUY_AMOUNT_USD,
                 'expected_tokens': float(quote.get('outAmount', 0)),
-                'tx_id': result.get('tx_id'),
-                'status': 'open'
+                'tx_id': tx_id,
+                'status': 'pending',
+                'confirmation_attempts': 0
             }
             
             self.active_positions[token_address] = position
             self.trade_history.append({**position, 'action': 'buy'})
             
-            print(f"✅ Bought {token_symbol}: {sol_amount} SOL")
+            print(f"✅ Bought {token_symbol}: {sol_amount} SOL (pending confirmation)")
             return {"success": True, "position": position}
             
         except Exception as e:
             return {"error": f"Buy execution failed: {str(e)}"}
     
+    def should_sell_position(self, position_data):
+        """Determine if position should be sold - consolidated logic"""
+        entry_price = position_data.get('entry_price', 0)
+        entry_time = position_data.get('entry_time')
+        token_address = position_data.get('token_address')
+        
+        if not all([entry_price, entry_time, token_address]):
+            return True, "missing_data"
+        
+        # Get current price
+        current_price = birdeye_api.get_price(token_address)
+        if not current_price:
+            return True, "no_price_data"
+        
+        # Calculate P&L
+        pnl_percent = (current_price - entry_price) / entry_price
+        
+        # Take profit
+        if pnl_percent >= TARGET_PROFIT:
+            return True, "take_profit"
+        
+        # Stop loss
+        if pnl_percent <= -STOP_LOSS:
+            return True, "stop_loss"
+        
+        # Time-based exit (30 minutes max hold)
+        time_held = (datetime.now() - entry_time).total_seconds() / 60
+        if time_held > 30:
+            return True, "time_limit"
+        
+        # Liquidity check (rug protection)
+        token_overview = birdeye_api.get_token_overview(token_address)
+        current_liquidity = token_overview.get('liquidity', 0)
+        if current_liquidity < 5000:  # Less than $5k liquidity left
+            return True, "liquidity_drop"
+        
+        # Check for negative momentum with low activity
+        if pnl_percent < -0.05 and time_held > 5:  # -5% after 5 minutes
+            recent_trades = birdeye_api.get_recent_trades(token_address, limit=10)
+            if len(recent_trades) < 3:  # Very few recent trades
+                return True, "low_activity"
+        
+        return False, "hold"
+
+    def confirm_pending_transactions(self):
+        """Confirm pending transactions and update position status"""
+        confirmed_positions = []
+        failed_positions = []
+        
+        for token_address, position in list(self.active_positions.items()):
+            if position.get('status') != 'pending':
+                continue
+                
+            tx_id = position.get('tx_id')
+            if not tx_id:
+                continue
+            
+            # Check transaction status
+            tx_status = self.wallet.get_transaction_status(tx_id)
+            position['confirmation_attempts'] = position.get('confirmation_attempts', 0) + 1
+            
+            if tx_status == "confirmed":
+                # Verify actual token balance
+                actual_balance = self.wallet.get_token_balance(token_address)
+                if actual_balance > 0:
+                    position['status'] = 'open'
+                    position['actual_tokens'] = actual_balance
+                    confirmed_positions.append(position)
+                    print(f"✅ Confirmed: {position['token_symbol']} ({actual_balance} tokens)")
+                else:
+                    # Transaction confirmed but no tokens - possible MEV or failed swap
+                    position['status'] = 'failed'
+                    position['failure_reason'] = 'no_tokens_received'
+                    failed_positions.append(position)
+                    print(f"❌ Failed: {position['token_symbol']} - no tokens received")
+                    
+            elif tx_status == "failed":
+                position['status'] = 'failed' 
+                position['failure_reason'] = 'transaction_failed'
+                failed_positions.append(position)
+                print(f"❌ Failed: {position['token_symbol']} - transaction failed")
+                
+            elif position['confirmation_attempts'] > 10:  # Stop checking after 10 attempts
+                position['status'] = 'timeout'
+                position['failure_reason'] = 'confirmation_timeout'
+                failed_positions.append(position)
+                print(f"⏰ Timeout: {position['token_symbol']} - confirmation timeout")
+        
+        # Remove failed positions from active
+        for position in failed_positions:
+            token_address = position['token_address']
+            if token_address in self.active_positions:
+                del self.active_positions[token_address]
+                # Update trade history
+                self.trade_history.append({**position, 'action': 'failed_buy'})
+        
+        return confirmed_positions, failed_positions
+
+    def monitor_positions(self):
+        """Monitor all active positions and execute sells when needed"""
+        # First confirm any pending transactions
+        self.confirm_pending_transactions()
+        
+        positions_to_sell = []
+        
+        for token_address, position in self.active_positions.items():
+            # Only check confirmed positions for selling
+            if position.get('status') != 'open':
+                continue
+                
+            should_sell, reason = self.should_sell_position(position)
+            if should_sell:
+                positions_to_sell.append((token_address, reason))
+        
+        # Execute sells
+        results = []
+        for token_address, reason in positions_to_sell:
+            result = self.execute_sniper_sell(token_address, reason)
+            results.append(result)
+        
+        return results
+
     def execute_sniper_sell(self, token_address, reason="manual"):
         """Execute sell order for position"""
         if token_address not in self.active_positions:
@@ -93,6 +220,8 @@ class TradeManager:
         
         position = self.active_positions[token_address]
         token_symbol = position['token_symbol']
+        sell_tx_sent = False
+        sell_tx_id = None
         
         try:
             # Get current token balance
@@ -127,6 +256,31 @@ class TradeManager:
             if result.get('error'):
                 return result
             
+            # Transaction sent successfully - mark it
+            sell_tx_sent = True
+            sell_tx_id = result.get('tx_id')
+            
+        except Exception as e:
+            # If transaction was sent but post-processing failed, still remove position
+            if sell_tx_sent:
+                position.update({
+                    'exit_time': datetime.now(),
+                    'exit_price': 0,
+                    'pnl_percent': 0,
+                    'exit_reason': f"{reason}_error",
+                    'status': 'closed',
+                    'sell_tx_id': sell_tx_id,
+                    'error': str(e)
+                })
+                self.trade_history.append({**position, 'action': 'sell'})
+                del self.active_positions[token_address]
+                print(f"⚠️ Sold {token_symbol} (tx sent but error in post-processing: {e})")
+                return {"success": True, "position": position, "warning": str(e)}
+            
+            return {"error": f"Sell execution failed: {str(e)}"}
+        
+        # Post-transaction processing (outside try-catch for transaction sending)
+        try:
             # Calculate P&L
             current_price = birdeye_api.get_price(token_address) or 0
             entry_price = position['entry_price']
@@ -139,18 +293,30 @@ class TradeManager:
                 'pnl_percent': pnl_percent,
                 'exit_reason': reason,
                 'status': 'closed',
-                'sell_tx_id': result.get('tx_id')
+                'sell_tx_id': sell_tx_id
             })
             
-            # Move to history and remove from active
-            self.trade_history.append({**position, 'action': 'sell'})
-            del self.active_positions[token_address]
-            
             print(f"✅ Sold {token_symbol}: {pnl_percent:+.2f}% P&L")
-            return {"success": True, "position": position}
             
         except Exception as e:
-            return {"error": f"Sell execution failed: {str(e)}"}
+            # Fallback if price calculation fails
+            position.update({
+                'exit_time': datetime.now(),
+                'exit_price': 0,
+                'pnl_percent': 0,
+                'exit_reason': reason,
+                'status': 'closed',
+                'sell_tx_id': sell_tx_id,
+                'price_error': str(e)
+            })
+            
+            print(f"✅ Sold {token_symbol} (price calculation failed: {e})")
+        
+        # Always remove from active positions and add to history if tx was sent
+        self.trade_history.append({**position, 'action': 'sell'})
+        del self.active_positions[token_address]
+        
+        return {"success": True, "position": position}
     
     def get_active_positions(self):
         """Get list of active positions"""
@@ -162,10 +328,12 @@ class TradeManager:
     
     def get_portfolio_summary(self):
         """Get portfolio summary statistics"""
-        active_positions = len(self.active_positions)
+        active_positions = len([p for p in self.active_positions.values() if p.get('status') == 'open'])
+        pending_positions = len([p for p in self.active_positions.values() if p.get('status') == 'pending'])
         
         # Calculate total P&L from closed positions
         closed_trades = [t for t in self.trade_history if t.get('action') == 'sell']
+        failed_trades = [t for t in self.trade_history if t.get('action') == 'failed_buy']
         total_pnl_percent = sum(t.get('pnl_percent', 0) for t in closed_trades)
         avg_pnl = total_pnl_percent / len(closed_trades) if closed_trades else 0
         
@@ -175,6 +343,8 @@ class TradeManager:
         return {
             'sol_balance': sol_balance,
             'active_positions': active_positions,
+            'pending_positions': pending_positions,
+            'failed_positions': len(failed_trades),
             'total_trades': len([t for t in self.trade_history if t.get('action') == 'buy']),
             'total_pnl_percent': total_pnl_percent,
             'avg_pnl_percent': avg_pnl,

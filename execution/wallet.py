@@ -82,8 +82,13 @@ class SolanaWallet:
         
         try:
             if isinstance(transaction_data, str):
-                # Deserialize transaction from base64
-                tx_bytes = base58.b58decode(transaction_data)
+                # Try base64 first (Jupiter default), fallback to base58
+                try:
+                    import base64
+                    tx_bytes = base64.b64decode(transaction_data)
+                except Exception:
+                    tx_bytes = base58.b58decode(transaction_data)
+                
                 transaction = VersionedTransaction.from_bytes(tx_bytes)
             else:
                 transaction = transaction_data

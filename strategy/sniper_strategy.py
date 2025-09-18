@@ -130,50 +130,6 @@ class SniperStrategy:
         except Exception:
             return False
     
-    def should_sell(self, position_data):
-        """Determine if we should sell a position"""
-        
-        entry_price = position_data.get('entry_price', 0)
-        entry_time = position_data.get('entry_time')
-        token_address = position_data.get('token_address')
-        
-        if not all([entry_price, entry_time, token_address]):
-            return True, "missing_data"
-        
-        # Get current price
-        current_price = birdeye_api.get_price(token_address)
-        if not current_price:
-            return True, "no_price_data"
-        
-        # Calculate P&L
-        pnl_percent = (current_price - entry_price) / entry_price
-        
-        # Take profit
-        if pnl_percent >= TARGET_PROFIT:
-            return True, "take_profit"
-        
-        # Stop loss
-        if pnl_percent <= -STOP_LOSS:
-            return True, "stop_loss"
-        
-        # Time-based exit
-        time_held = (datetime.now() - entry_time).total_seconds() / 60
-        if time_held > self.max_hold_time_minutes:
-            return True, "time_limit"
-        
-        # Liquidity check (rug protection)
-        token_overview = birdeye_api.get_token_overview(token_address)
-        current_liquidity = token_overview.get('liquidity', 0)
-        if current_liquidity < 5000:  # Less than $5k liquidity left
-            return True, "liquidity_drop"
-        
-        # Check for negative momentum
-        if pnl_percent < -0.05 and time_held > 5:  # -5% after 5 minutes
-            recent_trades = birdeye_api.get_recent_trades(token_address, limit=10)
-            if len(recent_trades) < 3:  # Very few recent trades
-                return True, "low_activity"
-        
-        return False, "hold"
     
     def _check_token_security(self, token_data):
         """Check token security via BirdEye"""
@@ -269,13 +225,6 @@ sniper_strategy = SniperStrategy()
 def should_buy(token_data):
     return sniper_strategy.should_buy(token_data)[0]
 
-def should_sell(entry_price, current_price):
-    position_data = {
-        'entry_price': entry_price,
-        'entry_time': datetime.now() - timedelta(minutes=10),  # Assume 10 min ago
-        'token_address': 'dummy'
-    }
-    return sniper_strategy.should_sell(position_data)[1] if sniper_strategy.should_sell(position_data)[0] else None
 
 def position_size(balance, fixed_usd=None):
     return fixed_usd or BUY_AMOUNT_USD
