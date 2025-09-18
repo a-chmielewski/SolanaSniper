@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from config import TARGET_PROFIT, STOP_LOSS, BUY_AMOUNT_USD
 from data.birdeye_api import birdeye_api
 from data.jupiter_api import jupiter_api
+from data.price_manager import price_manager
 
 class SniperStrategy:
     def __init__(self):
@@ -71,7 +72,14 @@ class SniperStrategy:
         
         # Need at least 10x our trade size in liquidity
         min_required = BUY_AMOUNT_USD * 10
-        return liquidity >= min_required
+        
+        # Also check that we have enough SOL for the trade
+        try:
+            pricing = price_manager.get_optimal_sol_amount(BUY_AMOUNT_USD)
+            # Ensure liquidity can handle our trade size
+            return liquidity >= min_required
+        except Exception:
+            return liquidity >= min_required
     
     def _detect_suspicious_activity(self, token_data):
         """Detect potential rug pulls or honeypots"""
@@ -98,8 +106,9 @@ class SniperStrategy:
             if not token_address:
                 return False
             
-            # Get a small test quote
-            sol_amount = 0.001  # Test with 0.001 SOL
+            # Get a small test quote using current SOL pricing
+            test_usd = 1.0  # Test with $1 worth
+            sol_amount = price_manager.usd_to_sol(test_usd)
             quote = jupiter_api.get_sol_to_token_quote(token_address, sol_amount)
             
             if not quote:

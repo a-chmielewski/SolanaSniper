@@ -53,6 +53,23 @@ class JupiterAPI:
         # Convert SOL amount to lamports (1 SOL = 1e9 lamports)
         sol_lamports = int(sol_amount * 1e9)
         return self.get_quote(SOL_MINT, token_mint, sol_lamports, slippage_bps)
+    
+    def get_usd_to_sol_amount(self, usd_amount):
+        """Convert USD amount to SOL using Jupiter quote (USDC->SOL)"""
+        try:
+            usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            # Convert USD to USDC units (6 decimals)
+            usdc_amount = int(usd_amount * 1e6)
+            
+            # Get quote from USDC to SOL
+            quote = self.get_quote(usdc_mint, SOL_MINT, usdc_amount)
+            if quote and quote.get('outAmount'):
+                # Convert lamports to SOL
+                sol_amount = int(quote['outAmount']) / 1e9
+                return sol_amount
+            return None
+        except Exception:
+            return None
 
     def get_token_to_sol_quote(self, token_mint, token_amount, token_decimals=9, slippage_bps=50):
         """Get quote for token to SOL swap"""

@@ -2,6 +2,7 @@ import time
 from datetime import datetime
 from data.jupiter_api import jupiter_api, SOL_MINT
 from data.birdeye_api import birdeye_api
+from data.price_manager import price_manager
 from execution.wallet import load_wallet
 from config import BUY_AMOUNT_USD, TARGET_PROFIT, STOP_LOSS
 
@@ -19,12 +20,15 @@ class TradeManager:
         if not self.wallet.get_address():
             return {"error": "Wallet not loaded"}
         
-        # Check SOL balance
+        # Check SOL balance and calculate required amount
         sol_balance = self.wallet.get_sol_balance()
-        sol_amount = BUY_AMOUNT_USD / 100  # Assume $100 per SOL for estimation
         
-        if sol_balance < sol_amount:
-            return {"error": f"Insufficient SOL balance: {sol_balance}"}
+        # Use dynamic SOL pricing
+        is_valid, pricing_info = price_manager.validate_trade_amount(sol_balance, BUY_AMOUNT_USD)
+        if not is_valid:
+            return {"error": pricing_info}
+        
+        sol_amount = pricing_info['base_sol_amount']
         
         try:
             # Get quote from Jupiter
@@ -51,13 +55,19 @@ class TradeManager:
             if result.get('error'):
                 return result
             
+            # Get token decimals for accurate tracking
+            token_decimals = token_data.get('decimals', 9)
+            
             # Record position
             position = {
                 'token_address': token_address,
                 'token_symbol': token_symbol,
+                'token_decimals': token_decimals,
                 'entry_time': datetime.now(),
                 'entry_price': token_data.get('price', 0),
                 'sol_amount': sol_amount,
+                'sol_price_at_entry': pricing_info['sol_price_used'],
+                'usd_amount': BUY_AMOUNT_USD,
                 'expected_tokens': float(quote.get('outAmount', 0)),
                 'tx_id': result.get('tx_id'),
                 'status': 'open'
@@ -86,8 +96,10 @@ class TradeManager:
             if token_balance <= 0:
                 return {"error": "No tokens to sell"}
             
-            # Get quote for token to SOL
-            token_decimals = 9  # Default, should be fetched from token metadata
+            # Get token decimals from position data
+            token_decimals = position.get('token_decimals', 9)
+            
+            # Get quote for token to SOL using correct decimals
             quote = jupiter_api.get_token_to_sol_quote(
                 token_address, 
                 token_balance, 

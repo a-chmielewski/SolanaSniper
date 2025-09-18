@@ -69,6 +69,12 @@ class BirdEyeAPI:
         url = f"{BASE_URL}/defi/multi_price?list_address={addresses_str}"
         result = self._make_request(url)
         return result.get("data", {}) if result else {}
+    
+    def get_sol_price_usd(self):
+        """Get current SOL price in USD"""
+        sol_mint = "So11111111111111111111111111111111111111112"
+        price_data = self.get_price(sol_mint)
+        return price_data if price_data else 100.0  # Fallback to $100
 
     def get_trending_tokens(self, limit=50):
         """Get trending tokens on Solana"""

@@ -11,6 +11,7 @@ from datetime import datetime
 
 # Import all modules
 from config import BIRDEYE_API_KEY, WALLET_PRIVATE_KEY
+from data.price_manager import price_manager
 from strategy.filters import get_sniper_candidates
 from strategy.sniper_strategy import sniper_strategy
 from execution.trade_manager import trade_manager
@@ -44,8 +45,13 @@ class SolanaSniper:
         sol_balance = self.wallet.get_sol_balance()
         wallet_address = self.wallet.get_address()
         
+        # Get current SOL price
+        sol_price = price_manager.get_current_sol_price()
+        usd_balance = price_manager.sol_to_usd(sol_balance)
+        
         sniper_logger.log_success(f"Wallet: {wallet_address}")
-        sniper_logger.log_info(f"SOL Balance: {sol_balance:.4f}")
+        sniper_logger.log_info(f"SOL Balance: {sol_balance:.4f} (~${usd_balance:.2f})")
+        sniper_logger.log_info(f"SOL Price: ${sol_price:.2f}")
         alert_system.alert_system_startup(wallet_address, sol_balance)
         
         return True
@@ -128,10 +134,14 @@ class SolanaSniper:
     def print_status(self):
         try:
             portfolio = trade_manager.get_portfolio_summary()
+            sol_price = price_manager.get_current_sol_price()
+            usd_balance = price_manager.sol_to_usd(portfolio['sol_balance'])
+            
             print("\n" + "="*50)
             print("📊 SOLANA SNIPER STATUS")
             print("="*50)
-            print(f"SOL Balance: {portfolio['sol_balance']:.4f}")
+            print(f"SOL Price: ${sol_price:.2f}")
+            print(f"SOL Balance: {portfolio['sol_balance']:.4f} (~${usd_balance:.2f})")
             print(f"Active Positions: {portfolio['active_positions']}")
             print(f"Total P&L: {portfolio['total_pnl_percent']:+.2f}%")
             print("="*50)

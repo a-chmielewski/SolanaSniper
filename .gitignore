@@ -1,3 +1,4 @@
+/config.py
 /.cursor
 /config.json
 /logs
@@ -20,3 +21,4 @@ implementation_plan.md
 MODULE_IMPLEMENTATION_PLAN.md
 FIX TO DO LATER.txt
 .cursor
+config.py
