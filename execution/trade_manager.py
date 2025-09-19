@@ -1,7 +1,7 @@
 import time
 from datetime import datetime
 from data.jupiter_api import jupiter_api, SOL_MINT
-from data.birdeye_api import birdeye_api
+from data.dexscreener_api import dexscreener_api
 from data.price_manager import price_manager
 from execution.wallet import load_wallet
 from config import BUY_AMOUNT_USD, TARGET_PROFIT, STOP_LOSS
@@ -101,7 +101,7 @@ class TradeManager:
             return True, "missing_data"
         
         # Get current price
-        current_price = birdeye_api.get_price(token_address)
+        current_price = dexscreener_api.get_price(token_address)
         if not current_price:
             return True, "no_price_data"
         
@@ -122,15 +122,24 @@ class TradeManager:
             return True, "time_limit"
         
         # Liquidity check (rug protection)
-        token_overview = birdeye_api.get_token_overview(token_address)
-        current_liquidity = token_overview.get('liquidity', 0)
+        pairs = dexscreener_api.get_token_info(token_address)
+        best_pair = dexscreener_api._pick_best_pair(pairs)
+        current_liquidity = 0
+        if best_pair:
+            current_liquidity = float((best_pair.get('liquidity') or {}).get('usd', 0))
+        
         if current_liquidity < 5000:  # Less than $5k liquidity left
             return True, "liquidity_drop"
         
-        # Check for negative momentum with low activity
+        # Check for negative momentum - simplified without recent trades
         if pnl_percent < -0.05 and time_held > 5:  # -5% after 5 minutes
-            recent_trades = birdeye_api.get_recent_trades(token_address, limit=10)
-            if len(recent_trades) < 3:  # Very few recent trades
+            # DexScreener doesn't provide recent trades, so use volume as proxy
+            volume_24h = 0
+            if best_pair:
+                volume_data = best_pair.get('volume', {})
+                volume_24h = float(volume_data.get('h24', 0))
+            
+            if volume_24h < 10000:  # Very low volume
                 return True, "low_activity"
         
         return False, "hold"
@@ -282,7 +291,7 @@ class TradeManager:
         # Post-transaction processing (outside try-catch for transaction sending)
         try:
             # Calculate P&L
-            current_price = birdeye_api.get_price(token_address) or 0
+            current_price = dexscreener_api.get_price(token_address) or 0
             entry_price = position['entry_price']
             pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
             

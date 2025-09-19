@@ -1,7 +1,7 @@
 import time
 from datetime import datetime, timedelta
 from config import TARGET_PROFIT, STOP_LOSS, BUY_AMOUNT_USD
-from data.birdeye_api import birdeye_api
+# BirdEye API removed - security checks now use liquidity/price patterns
 from data.jupiter_api import jupiter_api
 from data.price_manager import price_manager
 

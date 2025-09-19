@@ -10,7 +10,7 @@ import sys
 from datetime import datetime
 
 # Import all modules
-from config import BIRDEYE_API_KEY, WALLET_PRIVATE_KEY
+from config import WALLET_PRIVATE_KEY
 from data.price_manager import price_manager
 from strategy.filters import get_sniper_candidates
 from strategy.sniper_strategy import sniper_strategy

@@ -42,13 +42,9 @@ class TokenFilter:
 
     def has_recent_trades(self, token_data):
         """Check if token has recent trading activity"""
-        last_trade_time = token_data.get('last_trade_ts', 0)
-        if not last_trade_time:
-            return False
-            
-        current_time = int(time.time())
-        minutes_since_trade = (current_time - last_trade_time) / 60
-        return minutes_since_trade <= self.max_last_trade_minutes
+        # DexScreener doesn't provide last_trade_ts, so check volume instead
+        volume_24h = token_data.get('volume_24h', 0)
+        return volume_24h > 0  # Any volume indicates recent activity
 
     def meets_market_cap_criteria(self, token_data):
         """Check if token meets market cap criteria"""
@@ -78,10 +74,13 @@ class TokenFilter:
 
     def has_valid_metadata(self, token_data):
         """Check if token has valid metadata"""
-        required_fields = ['address', 'symbol', 'name']
-        for field in required_fields:
-            if not token_data.get(field):
-                return False
+        # Must have address
+        if not token_data.get('address'):
+            return False
+        
+        # Must have symbol (enrichment should fill this)
+        if not token_data.get('symbol'):
+            return False
         
         # Check for suspicious names/symbols
         symbol = token_data.get('symbol', '').lower()
@@ -118,7 +117,7 @@ class TokenFilter:
             return False, f"24h volume {volume} below minimum {self.min_volume_24h}"
         
         if not self.has_recent_trades(token_data):
-            return False, "No recent trades"
+            return False, "No recent volume"
         
         return True, "Passed all filters"
 
@@ -165,7 +164,7 @@ class TokenFilter:
                     volume = token.get('volume_24h', 0)
                     if volume > 0:  # Only count when volume is known
                         filter_stats['volume_filtered'] += 1
-                elif 'No recent trades' in reason:
+                elif 'No recent volume' in reason:
                     filter_stats['no_recent_trades'] += 1
         
         return candidates, filter_stats
@@ -179,27 +178,49 @@ def calculate_token_score(token_data):
     if volume_24h > 0:
         score += min(volume_24h / 10000, 10)  # Max 10 points for volume
     
-    # Liquidity score
-    liquidity = token_data.get('liquidity', 0)
-    if liquidity > 0:
-        score += min(liquidity / 50000, 5)  # Max 5 points for liquidity
+    # Market cap score (prefer FDV if marketCap missing)
+    market_cap = token_data.get('market_cap', 0)
+    fdv = token_data.get('fdv', 0)
+    cap_value = market_cap if market_cap > 0 else fdv
+    if cap_value > 0:
+        score += min(cap_value / 100000, 5)  # Max 5 points for cap
     
-    # Recent activity score
-    last_trade_time = token_data.get('last_trade_ts', 0)
-    if last_trade_time > 0:
-        current_time = int(time.time())
-        minutes_since_trade = (current_time - last_trade_time) / 60
-        if minutes_since_trade <= 1:
-            score += 5  # Very recent trade
-        elif minutes_since_trade <= 5:
-            score += 3  # Recent trade
-        elif minutes_since_trade <= 15:
-            score += 1  # Somewhat recent
+    # Liquidity score with penalty for low liquidity
+    liquidity = token_data.get('liquidity', 0)
+    if liquidity >= 10000:
+        score += min(liquidity / 50000, 5)  # Max 5 points for liquidity
+    elif liquidity > 0:
+        score -= 2  # Penalty for low liquidity
+    
+    # Volume penalty for very low volume
+    if volume_24h > 0 and volume_24h < 20000:
+        score -= 1
+    
+    # Recent activity score (based on volume since no last_trade_ts)
+    if volume_24h > 100000:  # High volume
+        score += 5
+    elif volume_24h > 50000:  # Medium volume
+        score += 3
+    elif volume_24h > 10000:  # Low volume
+        score += 1
     
     # Price change score (positive momentum)
     price_change = token_data.get('price_24h_change', 0)
     if price_change > 0:
         score += min(price_change / 10, 3)  # Max 3 points for price momentum
+    
+    # Quote token preference (if available in token data)
+    quote_symbol = token_data.get('quote_symbol', '').upper()
+    if quote_symbol in ('USDC', 'SOL', 'WSOL'):
+        score += 2
+    
+    # Pair age scoring (if available)
+    created_at = token_data.get('created_at', 0)
+    if created_at > 0:
+        import time
+        age_minutes = (time.time() - created_at) / 60
+        if 2 <= age_minutes <= 180:  # 2 min to 3 hours
+            score += 2
     
     return score
 
@@ -228,14 +249,8 @@ def format_token_summary(token_data):
     }
 
 def get_minutes_since_last_trade(token_data):
-    """Get minutes since last trade"""
-    last_trade_time = token_data.get('last_trade_ts', 0)
-    if not last_trade_time:
-        return "N/A"
-    
-    current_time = int(time.time())
-    minutes_ago = (current_time - last_trade_time) / 60
-    return f"{minutes_ago:.1f}"
+    """Get minutes since last trade - DexScreener doesn't provide this"""
+    return "N/A"  # DexScreener doesn't provide last trade timestamp
 
 def save_candidates_to_csv(candidates, filename=None):
     """Save filtered candidates to CSV file"""

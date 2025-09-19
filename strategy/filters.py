@@ -1,20 +1,20 @@
 from data.utils import token_filter, rank_tokens_by_score
-from data.birdeye_api import birdeye_api
+from data.dexscreener_api import dexscreener_api
 
 def apply_filters(raw_tokens):
     """Apply all filtering logic to raw token data"""
     if not raw_tokens:
         return []
     
-    # Format tokens using BirdEye API formatter
+    # Format tokens using DexScreener API formatter
     formatted_tokens = []
     for token in raw_tokens:
-        formatted = birdeye_api.format_token_data(token)
+        formatted = dexscreener_api.format_token_data(token)
         if formatted:
             formatted_tokens.append(formatted)
     
     # Enrich missing mc/volume/last_trade from overview
-    formatted_tokens = birdeye_api.enrich_with_overview(formatted_tokens)
+    formatted_tokens = dexscreener_api.enrich_with_overview(formatted_tokens)
     
     # Apply filters using the utility class
     candidates, filter_stats = token_filter.filter_tokens_batch(formatted_tokens)
@@ -43,13 +43,13 @@ def apply_filters(raw_tokens):
 
 def get_new_tokens_only():
     """Get only newly created tokens from trending list"""
-    trending = birdeye_api.get_trending_tokens(limit=20)
+    trending = dexscreener_api.get_trending_tokens(limit=20)
     if not trending:
         return []
     
     new_tokens = []
     for token in trending:
-        formatted = birdeye_api.format_token_data(token)
+        formatted = dexscreener_api.format_token_data(token)
         if formatted and token_filter.is_new_token(formatted):
             new_tokens.append(formatted)
     
@@ -57,13 +57,13 @@ def get_new_tokens_only():
 
 def get_high_volume_tokens():
     """Get tokens with recent high volume spikes"""
-    trending = birdeye_api.get_trending_tokens(limit=20)
+    trending = dexscreener_api.get_trending_tokens(limit=20)
     if not trending:
         return []
     
     high_volume = []
     for token in trending:
-        formatted = birdeye_api.format_token_data(token)
+        formatted = dexscreener_api.format_token_data(token)
         if formatted:
             volume_24h = formatted.get('volume_24h', 0)
             if volume_24h > 50000:  # $50k+ volume
@@ -90,7 +90,7 @@ def get_sniper_candidates():
     print("🔍 Scanning for sniper candidates...")
     
     # Get tokens from multiple sources
-    trending_tokens = birdeye_api.get_trending_tokens(limit=20) or []  # Max limit is 20
+    trending_tokens = dexscreener_api.get_trending_tokens(limit=20) or []  # Max limit is 20
     # print(f"Discovery: fetched={len(trending_tokens)} before filtering")
     
     # Apply main filters

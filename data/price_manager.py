@@ -4,7 +4,7 @@ Price Manager - Handles dynamic pricing and conversions
 
 import time
 from datetime import datetime, timedelta
-from data.birdeye_api import birdeye_api
+# BirdEye API removed - using Jupiter for SOL pricing
 from data.jupiter_api import jupiter_api
 
 class PriceManager:
@@ -35,18 +35,9 @@ class PriceManager:
         return self.sol_price_cache or self.fallback_sol_price
     
     def _fetch_sol_price(self):
-        """Fetch SOL price using multiple methods"""
+        """Fetch SOL price using Jupiter quotes"""
         
-        # Method 1: BirdEye direct price
-        try:
-            price = birdeye_api.get_sol_price_usd()
-            if price and price > 0:
-                print(f"📊 SOL price from BirdEye: ${price:.2f}")
-                return price
-        except Exception as e:
-            print(f"BirdEye SOL price failed: {e}")
-        
-        # Method 2: Jupiter USDC->SOL quote (reverse calculation)
+        # Method 1: Jupiter USDC->SOL quote (reverse calculation)
         try:
             # Quote 100 USDC for SOL to get price
             usdc_amount = 100
