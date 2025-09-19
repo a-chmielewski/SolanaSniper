@@ -75,6 +75,7 @@ def get_sniper_candidates():
     
     # Get tokens from multiple sources
     trending_tokens = birdeye_api.get_trending_tokens(limit=20) or []  # Max limit is 20
+    # print(f"Discovery: fetched={len(trending_tokens)} before filtering")
     
     # Apply main filters
     candidates = apply_filters(trending_tokens)
