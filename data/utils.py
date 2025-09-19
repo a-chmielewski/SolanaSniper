@@ -42,7 +42,7 @@ class TokenFilter:
 
     def has_recent_trades(self, token_data):
         """Check if token has recent trading activity"""
-        last_trade_time = token_data.get('last_trade_unix_time', 0)
+        last_trade_time = token_data.get('last_trade_ts', 0)
         if not last_trade_time:
             return False
             
@@ -53,8 +53,9 @@ class TokenFilter:
     def meets_market_cap_criteria(self, token_data):
         """Check if token meets market cap criteria"""
         market_cap = token_data.get('market_cap', 0)
+        # If unknown, don't filter on mcap
         if market_cap <= 0:
-            return False
+            return True
         return self.min_mcap <= market_cap <= self.max_mcap
 
     def meets_liquidity_criteria(self, token_data):
@@ -65,6 +66,9 @@ class TokenFilter:
     def meets_volume_criteria(self, token_data):
         """Check if token meets 24h volume criteria"""
         volume_24h = token_data.get('volume_24h', 0)
+        # If unknown, don't filter on volume
+        if volume_24h <= 0:
+            return True
         return volume_24h >= self.min_volume_24h
 
     def is_excluded_token(self, token_data):
@@ -132,6 +136,13 @@ class TokenFilter:
             'passed': 0
         }
         
+        # Debug first 5 tokens
+        for i, token in enumerate(tokens_list[:5]):
+            passed, reason = self.filter_token(token)
+            symbol = token.get('symbol', 'UNKNOWN')
+            address = token.get('address', 'NO_ADDR')[:8]
+            print(f"Drop {symbol} {address}: {reason}")
+        
         for token in tokens_list:
             passed, reason = self.filter_token(token)
             
@@ -145,11 +156,15 @@ class TokenFilter:
                 elif 'Invalid metadata' in reason:
                     filter_stats['invalid_metadata'] += 1
                 elif 'Market cap' in reason:
-                    filter_stats['market_cap_filtered'] += 1
+                    mcap = token.get('market_cap', 0)
+                    if mcap > 0:  # Only count when mcap is known
+                        filter_stats['market_cap_filtered'] += 1
                 elif 'Liquidity' in reason:
                     filter_stats['liquidity_filtered'] += 1
                 elif '24h volume' in reason:
-                    filter_stats['volume_filtered'] += 1
+                    volume = token.get('volume_24h', 0)
+                    if volume > 0:  # Only count when volume is known
+                        filter_stats['volume_filtered'] += 1
                 elif 'No recent trades' in reason:
                     filter_stats['no_recent_trades'] += 1
         
@@ -170,7 +185,7 @@ def calculate_token_score(token_data):
         score += min(liquidity / 50000, 5)  # Max 5 points for liquidity
     
     # Recent activity score
-    last_trade_time = token_data.get('last_trade_unix_time', 0)
+    last_trade_time = token_data.get('last_trade_ts', 0)
     if last_trade_time > 0:
         current_time = int(time.time())
         minutes_since_trade = (current_time - last_trade_time) / 60
@@ -214,7 +229,7 @@ def format_token_summary(token_data):
 
 def get_minutes_since_last_trade(token_data):
     """Get minutes since last trade"""
-    last_trade_time = token_data.get('last_trade_unix_time', 0)
+    last_trade_time = token_data.get('last_trade_ts', 0)
     if not last_trade_time:
         return "N/A"
     

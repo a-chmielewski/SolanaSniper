@@ -13,8 +13,24 @@ def apply_filters(raw_tokens):
         if formatted:
             formatted_tokens.append(formatted)
     
+    # Enrich missing mc/volume/last_trade from overview
+    formatted_tokens = birdeye_api.enrich_with_overview(formatted_tokens)
+    
     # Apply filters using the utility class
     candidates, filter_stats = token_filter.filter_tokens_batch(formatted_tokens)
+    
+    # Print filter breakdown
+    print("Filter stats:", {k: v for k, v in filter_stats.items()})
+    
+    # Print sample formatted token for debugging
+    if formatted_tokens:
+        print("Sample formatted:", {
+            'symbol': formatted_tokens[0]['symbol'],
+            'mcap': formatted_tokens[0]['market_cap'],
+            'vol24': formatted_tokens[0]['volume_24h'],
+            'liq': formatted_tokens[0]['liquidity'],
+            'last_trade_ts': formatted_tokens[0]['last_trade_ts'],
+        })
     
     # Rank candidates by score
     ranked_candidates = rank_tokens_by_score(candidates)

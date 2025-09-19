@@ -144,53 +144,36 @@ class BirdEyeAPI:
             return []
 
 
-    def format_token_data(self, token):
-        if not isinstance(token, dict):
+    def format_token_data(self, t):
+        if not isinstance(t, dict):
             return None
 
-        address = (
-            token.get('address') or token.get('mint') or
-            token.get('token_address') or token.get('tokenAddress')
-        )
-        symbol = token.get('symbol') or token.get('tokenSymbol') or token.get('baseSymbol') or ""
-        name = token.get('name') or token.get('tokenName') or ""
+        address = t.get('address') or t.get('mint') or t.get('token_address') or t.get('tokenAddress')
+        symbol  = t.get('symbol')  or t.get('tokenSymbol') or t.get('baseSymbol') or ""
+        name    = t.get('name')    or t.get('tokenName')   or ""
+        decimals = t.get('decimals') or t.get('token_decimals') or t.get('tokenDecimals') or 9
 
-        decimals = (
-            token.get('decimals') or token.get('token_decimals') or
-            token.get('tokenDecimals') or 9
-        )
-
-        # Price (USD)
         price = (
-            token.get('price') or token.get('priceUsd') or
-            (token.get('value') and token['value'].get('price')) or
-            token.get('price_usd') or 0.0
+            t.get('price') or t.get('priceUsd') or
+            (t.get('value') and t['value'].get('price')) or 0.0
         )
-
-        # 24h change (percent)
-        price_change_24h = (
-            token.get('price24hChangePercent') or token.get('priceChange24h') or
-            token.get('price_change_24h') or token.get('change24h') or 0.0
-        )
-
-        # 24h volume (USD)
+        market_cap = t.get('mc') or t.get('marketCapUsd') or t.get('market_cap') or 0.0
         volume_24h = (
-            token.get('v24hUSD') or token.get('volume24hUsd') or
-            token.get('volume_24h_usd') or token.get('volume_24h') or 0.0
+            t.get('v24hUSD') or t.get('volume24hUsd') or
+            t.get('v24h') or t.get('volume_24h') or 0.0
+        )
+        liquidity  = t.get('liquidity') or t.get('liquidityUsd') or t.get('poolLiquidityUsd') or 0.0
+        change_24h = (
+            t.get('price24hChangePercent') or t.get('priceChange24h') or
+            t.get('price_change_24h') or 0.0
         )
 
-        # Liquidity (USD)
-        liquidity = (
-            token.get('liquidity') or token.get('liquidityUsd') or
-            token.get('poolLiquidityUsd') or 0.0
-        )
-
-        # Timestamps
-        created_at = token.get('createdAt') or token.get('created_at') or 0
+        # standardize to last_trade_ts (seconds)
         last_trade_ts = (
-            token.get('lastTradeUnixTime') or token.get('lastTradeTime') or
-            token.get('last_trade_ts') or 0
+            t.get('lastTradeUnixTime') or t.get('lastTradeTime') or
+            t.get('last_trade_ts') or 0
         )
+        created_at    = t.get('createdAt') or t.get('created_at') or 0
 
         if not address or not symbol:
             return None
@@ -201,17 +184,21 @@ class BirdEyeAPI:
                 'symbol': symbol,
                 'name': name,
                 'decimals': int(decimals),
-                'supply': token.get('supply') or token.get('totalSupply') or 0,
-                'market_cap': token.get('mc') or token.get('marketCapUsd') or token.get('market_cap') or 0.0,
+                'supply': t.get('supply') or t.get('totalSupply') or 0,
+                'market_cap': float(market_cap) or 0.0,
                 'price': float(price) if price is not None else 0.0,
-                'price_24h_change': float(price_change_24h) if price_change_24h is not None else 0.0,
+                'price_24h_change': float(change_24h) if change_24h is not None else 0.0,
                 'volume_24h': float(volume_24h) if volume_24h is not None else 0.0,
                 'liquidity': float(liquidity) if liquidity is not None else 0.0,
                 'created_at': created_at,
-                'last_trade_unix_time': last_trade_ts
+                'last_trade_ts': last_trade_ts,
             }
         except Exception:
             return None
+
+    def enrich_with_overview(self, formatted_tokens):
+        # Skip enrichment to avoid 401 errors on paid endpoints
+        return formatted_tokens
 
 
 # Global instance

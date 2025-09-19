@@ -60,7 +60,7 @@ class SniperStrategy:
             return False
         
         # Must have recent trading activity
-        last_trade_time = token_data.get('last_trade_unix_time', 0)
+        last_trade_time = token_data.get('last_trade_ts', 0)
         if not last_trade_time:
             return False
         
@@ -132,36 +132,25 @@ class SniperStrategy:
     
     
     def _check_token_security(self, token_data):
-        """Check token security via BirdEye"""
-        token_address = token_data.get('address')
-        if not token_address:
+        """Check token security using liquidity and price change patterns"""
+        
+        # Use liquidity as main security indicator
+        liquidity = token_data.get('liquidity', 0)
+        if liquidity < 1000:  # Very low liquidity is risky
             return False
         
-        try:
-            security_data = birdeye_api.get_token_security(token_address)
-            if not security_data:
-                return True  # If no data, don't block (might be new token)
-            
-            # Check for honeypot flags
-            if security_data.get('is_honeypot', False):
+        # Check for suspicious price movements
+        price_change = token_data.get('price_24h_change', 0)
+        if abs(price_change) > 500:  # Extreme price swings indicate manipulation
+            return False
+        
+        # Check liquidity to price change ratio
+        if liquidity > 0 and abs(price_change) > 0:
+            volatility_ratio = abs(price_change) / (liquidity / 1000)
+            if volatility_ratio > 10:  # High volatility with low liquidity is suspicious
                 return False
-            
-            # Check for suspicious flags
-            if security_data.get('is_scam', False):
-                return False
-            
-            # Check contract verification
-            if security_data.get('is_verified') == False:
-                return False
-            
-            # Check for mint/freeze authority (risky if enabled)
-            if security_data.get('can_mint', True) or security_data.get('can_freeze', True):
-                return False
-            
-            return True
-            
-        except Exception:
-            return True  # Don't block on API errors
+        
+        return True
     
     def calculate_position_size(self, wallet_balance, token_data):
         """Calculate appropriate position size"""
@@ -206,7 +195,7 @@ class SniperStrategy:
             signal_strength += 10
         
         # Recency signal (0-25 points)
-        last_trade_time = token_data.get('last_trade_unix_time', 0)
+        last_trade_time = token_data.get('last_trade_ts', 0)
         if last_trade_time:
             minutes_ago = (time.time() - last_trade_time) / 60
             if minutes_ago < 1:  # Less than 1 minute
