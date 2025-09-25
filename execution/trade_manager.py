@@ -11,6 +11,7 @@ class TradeManager:
         self.wallet = load_wallet()
         self.active_positions = {}
         self.trade_history = []
+        self.in_flight_buy = False
     
     def execute_sniper_buy(self, token_data):
         """Execute buy order for sniping"""
@@ -24,15 +25,38 @@ class TradeManager:
         if token_address in self.active_positions:
             return {"error": f"Already have position in {token_symbol}"}
         
-        # Check SOL balance and calculate required amount
+        # Refresh balance and calculate spendable amount
         sol_balance = self.wallet.get_sol_balance()
         
-        # Use dynamic SOL pricing
-        is_valid, pricing_info = price_manager.validate_trade_amount(sol_balance, BUY_AMOUNT_USD)
-        if not is_valid:
-            return {"error": pricing_info}
+        # Fee buffer constants
+        FEE_BUFFER_SOL = 0.01      # ~0.01 SOL safety buffer (rent + fees)
+        MIN_RESIDUAL_SOL = 0.005   # leave some SOL after buy
         
-        sol_amount = pricing_info['base_sol_amount']
+        effective_spendable = max(0.0, sol_balance - FEE_BUFFER_SOL - MIN_RESIDUAL_SOL)
+        if effective_spendable <= 0:
+            return {"error": "Insufficient SOL after reserving fee buffer"}
+        
+        # Convert planned USD buy to SOL
+        planned_sol = price_manager.usd_to_sol(BUY_AMOUNT_USD)
+        
+        # Check if ATA exists and reserve rent if needed
+        ata_rent = 0.002  # Estimated ATA creation rent
+        try:
+            token_balance = self.wallet.get_token_balance(token_address)
+            if token_balance == 0:  # ATA likely doesn't exist
+                effective_spendable -= ata_rent
+        except:
+            # Assume ATA doesn't exist
+            effective_spendable -= ata_rent
+        
+        # Cap to spendable amount after ATA consideration
+        sol_amount = min(planned_sol, effective_spendable)
+        
+        # Preflight logging
+        print(f"Preflight: balance={sol_balance:.3f} SOL, fee_buffer={FEE_BUFFER_SOL:.3f} SOL, min_residual={MIN_RESIDUAL_SOL:.3f} SOL, ata_rent={ata_rent:.3f} SOL, spendable={effective_spendable:.3f} SOL, planned={planned_sol:.4f} SOL → capped={sol_amount:.4f} SOL")
+        
+        if sol_amount < 0.002:   # too small to be practical
+            return {"error": "Buy size too small after fees; skipping"}
         
         try:
             # Get quote from Jupiter
@@ -74,7 +98,7 @@ class TradeManager:
                 'entry_time': datetime.now(),
                 'entry_price': token_data.get('price', 0),
                 'sol_amount': sol_amount,
-                'sol_price_at_entry': pricing_info['sol_price_used'],
+                'sol_price_at_entry': price_manager.get_current_sol_price(),
                 'usd_amount': BUY_AMOUNT_USD,
                 'expected_tokens': float(quote.get('outAmount', 0)),
                 'tx_id': tx_id,

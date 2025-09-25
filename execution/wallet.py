@@ -89,13 +89,16 @@ class SolanaWallet:
                 except Exception:
                     tx_bytes = base58.b58decode(transaction_data)
                 
-                transaction = VersionedTransaction.from_bytes(tx_bytes)
+                # Parse the transaction to get message
+                unsigned_tx = VersionedTransaction.from_bytes(tx_bytes)
+                # Create new signed transaction with keypair
+                signed_tx = VersionedTransaction(unsigned_tx.message, [self.keypair])
+                return signed_tx
             else:
-                transaction = transaction_data
-            
-            # Sign transaction
-            transaction.sign([self.keypair])
-            return transaction
+                # If already a transaction object, recreate with signer
+                if hasattr(transaction_data, 'message'):
+                    return VersionedTransaction(transaction_data.message, [self.keypair])
+                return transaction_data
         except Exception as e:
             print(f"Error signing transaction: {e}")
             return None

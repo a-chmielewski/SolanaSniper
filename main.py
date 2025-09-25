@@ -68,7 +68,7 @@ class SolanaSniper:
             for candidate in candidates:
                 self.evaluate_candidate(candidate)
         except Exception as e:
-            sniper_logger.log_error(f"Scan failed: {str(e)}")
+            sniper_logger.log_error(f"Scan failed: {e!r}")
     
     def evaluate_candidate(self, token_data):
         token_symbol = token_data.get('symbol', 'UNKNOWN')
@@ -102,13 +102,24 @@ class SolanaSniper:
                 sniper_logger.log_warning("Position limit reached")
                 return
             
-            result = trade_manager.execute_sniper_buy(token_data)
+            # Check for in-flight buy
+            if trade_manager.in_flight_buy:
+                sniper_logger.log_info("Skip buy: another buy is in-flight")
+                return
+            
+            trade_manager.in_flight_buy = True
+            try:
+                result = trade_manager.execute_sniper_buy(token_data)
+            finally:
+                trade_manager.in_flight_buy = False
             
             if result.get('success'):
                 position = result['position']
                 sniper_logger.log_success(f"Bought {token_symbol}")
                 sniper_logger.log_trade('buy', token_data, position)
                 alert_system.alert_trade_executed('buy', token_symbol, position.get('sol_amount', 0), position.get('entry_price', 0))
+                # Refresh balance after successful buy for next candidate
+                trade_manager.wallet = load_wallet()
             else:
                 sniper_logger.log_error(f"Buy failed: {result.get('error')}")
         except Exception as e:

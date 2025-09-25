@@ -54,8 +54,10 @@ class SniperStrategy:
             if keyword in symbol or (name and keyword in name):
                 return False
         
-        # Market cap should be reasonable
+        # Market cap should be reasonable - use fdv as fallback
         market_cap = token_data.get('market_cap', 0)
+        if market_cap <= 0:
+            market_cap = token_data.get('fdv', 0)
         if market_cap <= 0 or market_cap > 1000000:  # Over $1M might be too established
             return False
         
@@ -148,15 +150,28 @@ class SniperStrategy:
         
         return True
     
-    def calculate_position_size(self, wallet_balance, token_data):
+    def calculate_position_size(self, wallet_balance_sol, token_data):
         """Calculate appropriate position size"""
         
-        # Use fixed amount for now, but could be dynamic based on:
-        # - Wallet balance
-        # - Token risk score
-        # - Market conditions
+        # Calculate spendable SOL after fee buffer
+        FEE_BUFFER_SOL = 0.01
+        MIN_RESIDUAL_SOL = 0.005
+        ATA_RENT = 0.002
         
-        max_position = min(BUY_AMOUNT_USD, wallet_balance * 0.1)  # Max 10% of balance
+        effective_spendable = max(0.0, wallet_balance_sol - FEE_BUFFER_SOL - MIN_RESIDUAL_SOL - ATA_RENT)
+        
+        # Convert to USD equivalent
+        from data.price_manager import price_manager
+        spendable_usd = price_manager.sol_to_usd(effective_spendable)
+        
+        # Use fixed amount for now, but cap by spendable balance
+        max_position = min(BUY_AMOUNT_USD, spendable_usd * 0.1)  # Max 10% of spendable balance
+        
+        # Hard-cap by available SOL
+        max_sol = price_manager.usd_to_sol(max_position)
+        if max_sol > effective_spendable:
+            max_position = price_manager.sol_to_usd(effective_spendable)
+        
         return max_position
     
     def get_entry_signals(self, token_data):

@@ -6,12 +6,19 @@ def apply_filters(raw_tokens):
     if not raw_tokens:
         return []
     
-    # Format tokens using DexScreener API formatter
-    formatted_tokens = []
+    # Validate input tokens - only require address before enrichment
+    validated_tokens = []
     for token in raw_tokens:
-        formatted = dexscreener_api.format_token_data(token)
-        if formatted:
-            formatted_tokens.append(formatted)
+        if not isinstance(token, dict):
+            print(f"❌ Invalid token type: {type(token)} - {str(token)[:100]}")
+            continue
+        if not token.get('address'):
+            print(f"❌ Token missing address: {token.get('symbol', 'UNKNOWN')} - {str(token)[:100]}")
+            continue
+        validated_tokens.append(token)
+    
+    # Skip formatting since tokens are already formatted
+    formatted_tokens = validated_tokens
     
     # Enrich missing mc/volume/last_trade from overview
     formatted_tokens = dexscreener_api.enrich_with_overview(formatted_tokens)
@@ -21,6 +28,10 @@ def apply_filters(raw_tokens):
     
     # Print filter breakdown
     print("Filter stats:", {k: v for k, v in filter_stats.items()})
+    
+    # Log enriched token if no candidates pass
+    if filter_stats.get('passed', 0) == 0 and formatted_tokens:
+        print(f"Sample enriched token: {formatted_tokens[0]}")
     
     # Print sample formatted token for debugging
     if formatted_tokens:
@@ -47,11 +58,19 @@ def get_new_tokens_only():
     if not trending:
         return []
     
-    new_tokens = []
+    formatted_tokens = []
     for token in trending:
         formatted = dexscreener_api.format_token_data(token)
-        if formatted and token_filter.is_new_token(formatted):
-            new_tokens.append(formatted)
+        if formatted:
+            formatted_tokens.append(formatted)
+    
+    # Enrich before checking creation date
+    enriched_tokens = dexscreener_api.enrich_with_overview(formatted_tokens)
+    
+    new_tokens = []
+    for token in enriched_tokens:
+        if token_filter.is_new_token(token):
+            new_tokens.append(token)
     
     return new_tokens
 
@@ -61,13 +80,20 @@ def get_high_volume_tokens():
     if not trending:
         return []
     
-    high_volume = []
+    formatted_tokens = []
     for token in trending:
         formatted = dexscreener_api.format_token_data(token)
         if formatted:
-            volume_24h = formatted.get('volume_24h', 0)
-            if volume_24h > 50000:  # $50k+ volume
-                high_volume.append(formatted)
+            formatted_tokens.append(formatted)
+    
+    # Enrich before checking volume
+    enriched_tokens = dexscreener_api.enrich_with_overview(formatted_tokens)
+    
+    high_volume = []
+    for token in enriched_tokens:
+        volume_24h = token.get('volume_24h', 0)
+        if volume_24h > 50000:  # $50k+ volume
+            high_volume.append(token)
     
     return sorted(high_volume, key=lambda x: x.get('volume_24h', 0), reverse=True)
 
@@ -89,52 +115,81 @@ def get_sniper_candidates():
     """Get the best candidates for sniping based on multiple criteria"""
     print("🔍 Scanning for sniper candidates...")
     
-    # Get tokens from multiple sources
-    trending_tokens = dexscreener_api.get_trending_tokens(limit=20) or []
-    new_tokens = get_new_tokens_only() or []
-    high_volume_tokens = get_high_volume_tokens() or []
-    
-    # Combine all sources and deduplicate
-    all_tokens = []
-    seen_addresses = set()
-    
-    # Add from all sources
-    for token_list in [trending_tokens, new_tokens, high_volume_tokens]:
-        for token in token_list:
-            if token.get('address') not in seen_addresses:
-                all_tokens.append(token)
-                seen_addresses.add(token['address'])
-    
-    print(f"Discovery: trending={len(trending_tokens)}, new={len(new_tokens)}, high_vol={len(high_volume_tokens)}, total={len(all_tokens)}")
-    
-    # Apply main filters
-    candidates = apply_filters(all_tokens)
-    
-    if not candidates:
-        print("❌ No candidates found")
+    try:
+        # Get tokens from multiple sources - all return formatted tokens
+        trending_tokens = []
+        trending_raw = dexscreener_api.get_trending_tokens(limit=20) or []
+        for raw_token in trending_raw:
+            try:
+                formatted = dexscreener_api.format_token_data(raw_token)
+                if formatted:
+                    trending_tokens.append(formatted)
+                else:
+                    print(f"❌ Failed to format token: {raw_token.get('baseToken', {}).get('symbol', 'UNKNOWN')} - {str(raw_token)[:200]}")
+            except Exception as e:
+                print(f"❌ Error formatting token: {str(e)} - {str(raw_token)[:100]}")
+        
+        new_tokens = get_new_tokens_only() or []
+        high_volume_tokens = get_high_volume_tokens() or []
+        
+        # Combine all sources and deduplicate
+        all_tokens = []
+        seen_addresses = set()
+        
+        # Add from all sources
+        for token_list in [trending_tokens, new_tokens, high_volume_tokens]:
+            for token in token_list:
+                try:
+                    address = token.get('address')
+                    if not address:
+                        print(f"❌ Token missing address: {token.get('symbol', 'UNKNOWN')} - {str(token)[:200]}")
+                        continue
+                    if address not in seen_addresses:
+                        all_tokens.append(token)
+                        seen_addresses.add(address)
+                except Exception as e:
+                    print(f"❌ Error processing token: {str(e)} - {str(token)[:100]}")
+        
+        print(f"Discovery: trending={len(trending_tokens)}, new={len(new_tokens)}, high_vol={len(high_volume_tokens)}, total={len(all_tokens)}")
+        
+        # Apply main filters
+        candidates = apply_filters(all_tokens)
+        
+        if not candidates:
+            print("❌ No candidates found")
+            return []
+        
+        # Additional filtering for momentum
+        momentum_candidates = filter_by_momentum(candidates)
+        
+        # Combine and deduplicate, excluding already held positions
+        from execution.trade_manager import trade_manager
+        final_candidates = []
+        seen_final = set()
+        
+        # Prioritize momentum candidates
+        for token in momentum_candidates:
+            try:
+                token_address = token['address']
+                if token_address not in seen_final and token_address not in trade_manager.active_positions:
+                    final_candidates.append(token)
+                    seen_final.add(token_address)
+            except Exception as e:
+                print(f"❌ Error processing momentum candidate: {str(e)}")
+        
+        # Add remaining candidates
+        for token in candidates:
+            try:
+                token_address = token['address']
+                if token_address not in seen_final and token_address not in trade_manager.active_positions and len(final_candidates) < 5:
+                    final_candidates.append(token)
+                    seen_final.add(token_address)
+            except Exception as e:
+                print(f"❌ Error processing candidate: {str(e)}")
+        
+        print(f"✅ Found {len(final_candidates)} sniper candidates")
+        return final_candidates[:5]  # Top 5 candidates
+        
+    except Exception as e:
+        print(f"❌ Critical error in get_sniper_candidates: {str(e)}")
         return []
-    
-    # Additional filtering for momentum
-    momentum_candidates = filter_by_momentum(candidates)
-    
-    # Combine and deduplicate, excluding already held positions
-    from execution.trade_manager import trade_manager
-    final_candidates = []
-    seen_final = set()
-    
-    # Prioritize momentum candidates
-    for token in momentum_candidates:
-        token_address = token['address']
-        if token_address not in seen_final and token_address not in trade_manager.active_positions:
-            final_candidates.append(token)
-            seen_final.add(token_address)
-    
-    # Add remaining candidates
-    for token in candidates:
-        token_address = token['address']
-        if token_address not in seen_final and token_address not in trade_manager.active_positions and len(final_candidates) < 5:
-            final_candidates.append(token)
-            seen_final.add(token_address)
-    
-    print(f"✅ Found {len(final_candidates)} sniper candidates")
-    return final_candidates[:5]  # Top 5 candidates
