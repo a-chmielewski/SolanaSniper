@@ -76,7 +76,10 @@ class APIClient:
                 last_exception = e
                 if attempt < self.max_retries - 1:
                     delay = self.exponential_backoff(attempt)
-                    print(f"⚠️ API timeout, retrying in {delay:.1f}s (attempt {attempt + 1}/{self.max_retries})")
+                    from monitoring.logger import sniper_logger
+                    sniper_logger.log_warning("API timeout", extra={
+                        'attempt': attempt + 1, 'max_retries': self.max_retries, 'delay_seconds': delay
+                    })
                     time.sleep(delay)
                     continue
                     
@@ -94,13 +97,19 @@ class APIClient:
                 
                 # Don't retry client errors (4xx)
                 if status_code and 400 <= status_code < 500:
-                    print(f"❌ Client error {status_code}, not retrying: {e}")
+                    from monitoring.logger import sniper_logger
+                    sniper_logger.log_error("Client error", extra={
+                        'status_code': status_code, 'error': str(e)
+                    })
                     break
                 
                 # Retry server errors (5xx) with backoff
                 if attempt < self.max_retries - 1:
                     delay = self.exponential_backoff(attempt)
-                    print(f"⚠️ Server error {status_code}, retrying in {delay:.1f}s (attempt {attempt + 1}/{self.max_retries})")
+                    from monitoring.logger import sniper_logger
+                    sniper_logger.log_warning("Server error", extra={
+                        'status_code': status_code, 'attempt': attempt + 1, 'max_retries': self.max_retries, 'delay_seconds': delay
+                    })
                     time.sleep(delay)
                     continue
                     
@@ -108,17 +117,27 @@ class APIClient:
                 last_exception = e
                 if attempt < self.max_retries - 1:
                     delay = self.exponential_backoff(attempt)
-                    print(f"⚠️ API error: {type(e).__name__}: {e}, retrying in {delay:.1f}s (attempt {attempt + 1}/{self.max_retries})")
+                    from monitoring.logger import sniper_logger
+                    sniper_logger.log_warning("API error", extra={
+                        'error_type': type(e).__name__, 'error': str(e), 'attempt': attempt + 1, 
+                        'max_retries': self.max_retries, 'delay_seconds': delay
+                    })
                     time.sleep(delay)
                     continue
         
         # All retries failed
-        print(f"❌ API call failed after {self.max_retries} attempts: {last_exception}")
+        from monitoring.logger import sniper_logger
+        sniper_logger.log_error("API call failed after retries", extra={
+            'max_retries': self.max_retries, 'last_exception': str(last_exception)
+        })
         
         # Return cached data if available as fallback
         if cache_key and cache_key in self.request_cache:
             cached_data = self.request_cache[cache_key]
-            print(f"🔄 Using stale cached data (age: {time.time() - cached_data['timestamp']:.0f}s)")
+            cache_age = time.time() - cached_data['timestamp']
+            sniper_logger.log_info("Using stale cached data", extra={
+                'cache_key': cache_key, 'cache_age_seconds': cache_age
+            })
             return cached_data['data']
         
         return None

@@ -99,6 +99,13 @@ class DexScreenerAPI:
             return None
 
 
+    def get_pool_creation_feed(self, limit=20):
+        """Get newly created pools from DexScreener"""
+        url = f"{BASE_URL}/pairs/solana/latest/v1"
+        result = self._make_request(url)
+        items = self._first_list(result)[:limit]
+        return [it for it in items if it.get('chainId') == 'solana']
+
     def get_trending_tokens(self, limit=20):
         latest  = self.get_latest_tokens(limit//2)
         boosted = self.get_boosted_tokens(limit - len(latest))
@@ -113,6 +120,24 @@ class DexScreenerAPI:
             if it.get('chainId') != 'solana':
                 continue
             addr = it.get('tokenAddress')
+            if not addr or addr in seen:
+                continue
+            seen.add(addr)
+            merged.append(it)
+            if len(merged) >= limit:
+                break
+        return merged
+
+    def get_all_discovery_sources(self, limit=20):
+        """Get tokens from all discovery sources"""
+        trending = self.get_trending_tokens(limit//2)
+        pools = self.get_pool_creation_feed(limit//2)
+        
+        seen, merged = set(), []
+        for it in trending + pools:
+            if it.get('chainId') != 'solana':
+                continue
+            addr = it.get('tokenAddress') or (it.get('baseToken') or {}).get('address')
             if not addr or addr in seen:
                 continue
             seen.add(addr)

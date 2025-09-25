@@ -1,19 +1,34 @@
 import time
 from datetime import datetime, timedelta
-from config import TARGET_PROFIT, STOP_LOSS, BUY_AMOUNT_USD
+from config import (
+    TARGET_PROFIT, STOP_LOSS, BUY_AMOUNT_USD, MIN_SIGNAL_STRENGTH,
+    MIN_LIQUIDITY_FOR_BUY, MAX_PRICE_IMPACT, MIN_VOLUME_SPIKE,
+    MAX_HOLD_TIME_MINUTES, RECENT_TRADE_THRESHOLD_MIN,
+    MAX_ESTABLISHED_MCAP, MAX_PRICE_CHANGE_24H, MAX_VOLUME_MCAP_RATIO,
+    MAX_EXTREME_PRICE_CHANGE, MAX_VOLATILITY_RATIO, TEST_QUOTE_USD,
+    HIGH_VOLUME_THRESHOLD, MED_VOLUME_THRESHOLD, LOW_VOLUME_THRESHOLD,
+    HIGH_LIQUIDITY_THRESHOLD, MED_LIQUIDITY_THRESHOLD, LOW_LIQUIDITY_THRESHOLD_SIGNAL,
+    FEE_BUFFER_SOL, MIN_RESIDUAL_SOL, ATA_RENT_SOL, MAX_POSITION_RATIO
+)
 # BirdEye API removed - security checks now use liquidity/price patterns
 from data.jupiter_api import jupiter_api
 from data.price_manager import price_manager
+from data.onchain_security import onchain_security
 
 class SniperStrategy:
     def __init__(self):
-        self.min_liquidity_for_buy = 10000  # $10k minimum
-        self.max_price_impact = 3.0  # 3% max price impact
-        self.min_volume_spike = 2.0  # 2x volume increase
-        self.max_hold_time_minutes = 30
+        self.min_liquidity_for_buy = MIN_LIQUIDITY_FOR_BUY
+        self.max_price_impact = MAX_PRICE_IMPACT
+        self.min_volume_spike = MIN_VOLUME_SPIKE
+        self.max_hold_time_minutes = MAX_HOLD_TIME_MINUTES
     
     def should_buy(self, token_data):
         """Determine if we should buy this token"""
+        
+        # Check signal strength first
+        signal_strength = self.get_entry_signals(token_data)
+        if signal_strength < MIN_SIGNAL_STRENGTH:
+            return False, f"Signal too weak: {signal_strength}/{MIN_SIGNAL_STRENGTH}"
         
         # Basic safety checks
         if not self._basic_safety_checks(token_data):
@@ -36,7 +51,7 @@ class SniperStrategy:
             return False, "Swap not feasible"
         
         # All checks passed
-        return True, "All checks passed"
+        return True, f"All checks passed (Signal: {signal_strength})"
     
     def _basic_safety_checks(self, token_data):
         """Basic safety checks for token"""
@@ -58,7 +73,7 @@ class SniperStrategy:
         market_cap = token_data.get('market_cap', 0)
         if market_cap <= 0:
             market_cap = token_data.get('fdv', 0)
-        if market_cap <= 0 or market_cap > 1000000:  # Over $1M might be too established
+        if market_cap <= 0 or market_cap > MAX_ESTABLISHED_MCAP:
             return False
         
         # Check for recent trading activity using volume as proxy
@@ -88,7 +103,7 @@ class SniperStrategy:
         
         # Check for extreme price movements (possible pump)
         price_change = token_data.get('price_24h_change', 0)
-        if price_change > 1000:  # More than 1000% in 24h is suspicious
+        if price_change > MAX_PRICE_CHANGE_24H:
             return True
         
         # Check volume to market cap ratio
@@ -96,7 +111,7 @@ class SniperStrategy:
         market_cap = token_data.get('market_cap', 1)
         
         volume_ratio = volume_24h / market_cap
-        if volume_ratio > 10:  # Volume 10x market cap is suspicious
+        if volume_ratio > MAX_VOLUME_MCAP_RATIO:
             return True
         
         return False
@@ -109,7 +124,7 @@ class SniperStrategy:
                 return False
             
             # Get a small test quote using current SOL pricing
-            test_usd = 1.0  # Test with $1 worth
+            test_usd = TEST_QUOTE_USD
             sol_amount = price_manager.usd_to_sol(test_usd)
             quote = jupiter_api.get_sol_to_token_quote(token_address, sol_amount)
             
@@ -130,22 +145,32 @@ class SniperStrategy:
     
     
     def _check_token_security(self, token_data):
-        """Check token security using liquidity and price change patterns"""
+        """Check token security using on-chain validation and patterns"""
         
-        # Use liquidity as main security indicator
+        token_address = token_data.get('address')
+        if not token_address:
+            return False
+        
+        # On-chain security checks (mint authority, freeze authority, honeypot)
+        security_result = onchain_security.check_token_security(token_address)
+        if not security_result.get('safe', False):
+            print(f"❌ On-chain security failed: {security_result.get('reason', 'unknown')}")
+            return False
+        
+        # Legacy liquidity and volatility checks
         liquidity = token_data.get('liquidity', 0)
         if liquidity < 1000:  # Very low liquidity is risky
             return False
         
         # Check for suspicious price movements
         price_change = token_data.get('price_24h_change', 0)
-        if abs(price_change) > 500:  # Extreme price swings indicate manipulation
+        if abs(price_change) > MAX_EXTREME_PRICE_CHANGE:
             return False
         
         # Check liquidity to price change ratio
         if liquidity > 0 and abs(price_change) > 0:
             volatility_ratio = abs(price_change) / (liquidity / 1000)
-            if volatility_ratio > 10:  # High volatility with low liquidity is suspicious
+            if volatility_ratio > MAX_VOLATILITY_RATIO:
                 return False
         
         return True
@@ -154,18 +179,14 @@ class SniperStrategy:
         """Calculate appropriate position size"""
         
         # Calculate spendable SOL after fee buffer
-        FEE_BUFFER_SOL = 0.01
-        MIN_RESIDUAL_SOL = 0.005
-        ATA_RENT = 0.002
-        
-        effective_spendable = max(0.0, wallet_balance_sol - FEE_BUFFER_SOL - MIN_RESIDUAL_SOL - ATA_RENT)
+        effective_spendable = max(0.0, wallet_balance_sol - FEE_BUFFER_SOL - MIN_RESIDUAL_SOL - ATA_RENT_SOL)
         
         # Convert to USD equivalent
         from data.price_manager import price_manager
         spendable_usd = price_manager.sol_to_usd(effective_spendable)
         
         # Use fixed amount for now, but cap by spendable balance
-        max_position = min(BUY_AMOUNT_USD, spendable_usd * 0.1)  # Max 10% of spendable balance
+        max_position = min(BUY_AMOUNT_USD, spendable_usd * MAX_POSITION_RATIO)
         
         # Hard-cap by available SOL
         max_sol = price_manager.usd_to_sol(max_position)
@@ -180,11 +201,11 @@ class SniperStrategy:
         
         # Volume signal (0-30 points)
         volume_24h = token_data.get('volume_24h', 0)
-        if volume_24h > 100000:  # $100k+
+        if volume_24h > HIGH_VOLUME_THRESHOLD:
             signal_strength += 30
-        elif volume_24h > 50000:  # $50k+
+        elif volume_24h > MED_VOLUME_THRESHOLD:
             signal_strength += 20
-        elif volume_24h > 20000:  # $20k+
+        elif volume_24h > LOW_VOLUME_THRESHOLD:
             signal_strength += 10
         
         # Price momentum signal (0-25 points)
@@ -198,11 +219,11 @@ class SniperStrategy:
         
         # Liquidity signal (0-20 points)
         liquidity = token_data.get('liquidity', 0)
-        if liquidity > 100000:  # $100k+
+        if liquidity > HIGH_LIQUIDITY_THRESHOLD:
             signal_strength += 20
-        elif liquidity > 50000:  # $50k+
+        elif liquidity > MED_LIQUIDITY_THRESHOLD:
             signal_strength += 15
-        elif liquidity > 20000:  # $20k+
+        elif liquidity > LOW_LIQUIDITY_THRESHOLD_SIGNAL:
             signal_strength += 10
         
         # Recency signal (0-25 points)

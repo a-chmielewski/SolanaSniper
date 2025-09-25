@@ -20,6 +20,10 @@ Key Features:
 import requests
 import time
 from datetime import datetime
+from config import (
+    JUPITER_RATE_LIMIT_DELAY, JUPITER_QUOTE_MAX_AGE_MS,
+    JUPITER_COMPUTE_UNIT_PRICE, JUPITER_DEFAULT_MAX_PRICE_IMPACT
+)
 
 BASE_URL = "https://quote-api.jup.ag/v6"
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -37,7 +41,7 @@ class JupiterAPI:
     
     def __init__(self):
         self.last_request_time = 0
-        self.rate_limit_delay = 0.1  # 100ms between requests
+        self.rate_limit_delay = JUPITER_RATE_LIMIT_DELAY
     
     def _make_request(self, url, method="GET", data=None):
         """Make rate-limited request with error handling"""
@@ -57,10 +61,14 @@ class JupiterAPI:
             if response.status_code == 200:
                 return response.json()
             else:
-                print(f"Jupiter API Error {response.status_code}: {response.text}")
+                from execution.trade_manager import trade_manager
+                error_msg = f"Jupiter API Error {response.status_code}: {response.text}"
+                trade_manager.circuit_breaker.record_api_failure('jupiter', error_msg)
                 return None
         except requests.exceptions.RequestException as e:
-            print(f"Jupiter request failed: {e}")
+            from execution.trade_manager import trade_manager
+            error_msg = f"Jupiter request failed: {e}"
+            trade_manager.circuit_breaker.record_api_failure('jupiter', error_msg)
             return None
 
     def get_quote(self, input_mint, output_mint, amount, slippage_bps=100, dynamic_slippage=False, exclude_dexes=None, max_accounts=None, prefer_direct=False):
@@ -104,8 +112,8 @@ class JupiterAPI:
         url = f"{BASE_URL}/quote?" + "&".join([f"{k}={v}" for k, v in params.items()])
         return self._make_request(url)
 
-    def get_sol_to_token_quote(self, token_mint, sol_amount, slippage_bps=50, dynamic_slippage=False, exclude_dexes=None, max_accounts=None, prefer_direct=False):
-        """Get quote for SOL to token swap"""
+    def get_sol_to_token_quote(self, token_mint, sol_amount, slippage_bps=50, dynamic_slippage=True, exclude_dexes=None, max_accounts=None, prefer_direct=False):
+        """Get quote for SOL to token swap with adaptive slippage"""
         # Convert SOL amount to lamports (1 SOL = 1e9 lamports)
         sol_lamports = int(sol_amount * 1e9)
         return self.get_quote(SOL_MINT, token_mint, sol_lamports, slippage_bps, dynamic_slippage, exclude_dexes, max_accounts, prefer_direct)
@@ -161,11 +169,14 @@ class JupiterAPI:
         current_time = time.time() * 1000  # Convert to ms
         quote_age = current_time - quote_time
         
-        if quote_age > 5000:  # Older than 5 seconds
-            print(f"⚠️ Quote is {quote_age/1000:.1f}s old, may be stale")
+        if quote_age > JUPITER_QUOTE_MAX_AGE_MS:
+            from monitoring.logger import sniper_logger
+            sniper_logger.log_warning("Stale Jupiter quote", extra={
+                'quote_age_seconds': quote_age/1000, 'threshold_seconds': 5
+            })
             
         # Use priority fees for hot pairs
-        compute_unit_price = 5000  # 5000 micro-lamports for competitive priority
+        compute_unit_price = JUPITER_COMPUTE_UNIT_PRICE
         
         swap_data = {
             'quoteResponse': quote_response,
@@ -213,13 +224,18 @@ class JupiterAPI:
             route_str = ' → '.join(route_labels) if route_labels else 'Direct'
             dex_str = ' → '.join(dex_labels) if dex_labels else 'N/A'
             
-            print(f"🔍 Jupiter Quote: in={in_amount}, out={out_amount}, threshold={other_amount_threshold}")
-            print(f"    Impact: {price_impact}%, Slippage: {slippage_bps}bps, Route: {route_str}")
-            print(f"    DEXes: {dex_str}")
+            from monitoring.logger import sniper_logger
+            sniper_logger.log_info("Jupiter quote details", extra={
+                'in_amount': in_amount, 'out_amount': out_amount, 'threshold': other_amount_threshold,
+                'price_impact_pct': price_impact, 'slippage_bps': slippage_bps, 
+                'route': route_str, 'dexes': dex_str
+            })
             
         except Exception as e:
-            print(f"⚠️ Error logging Jupiter quote: {e}")
-            print(f"    Raw quote keys: {list(quote_response.keys()) if quote_response else 'None'}")
+            from monitoring.logger import sniper_logger
+            sniper_logger.log_warning("Jupiter quote logging error", extra={
+                'error': str(e), 'quote_keys': list(quote_response.keys()) if quote_response else 'None'
+            })
 
     def get_token_price_impact(self, quote_response):
         """Calculate price impact from quote"""
@@ -234,7 +250,7 @@ class JupiterAPI:
             'other_amount_threshold': quote_response.get('otherAmountThreshold', 0)
         }
 
-    def validate_quote_for_sniper(self, quote_response, max_price_impact=5.0):
+    def validate_quote_for_sniper(self, quote_response, max_price_impact=JUPITER_DEFAULT_MAX_PRICE_IMPACT):
         """Validate quote is suitable for sniping"""
         if not quote_response:
             return False, "No quote response"

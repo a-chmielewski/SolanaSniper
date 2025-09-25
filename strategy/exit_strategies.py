@@ -31,11 +31,13 @@ from datetime import datetime
 
 # Import config constants
 try:
-    from config import TARGET_PROFIT, STOP_LOSS
+    from config import TARGET_PROFIT, STOP_LOSS, SCALED_EXIT_ENABLED, SCALED_EXIT_TIERS
 except ImportError:
     # Fallback values if config not available
     TARGET_PROFIT = 0.25  # 25% default target
     STOP_LOSS = 0.15     # 15% default stop loss
+    SCALED_EXIT_ENABLED = True
+    SCALED_EXIT_TIERS = [(0.2, 0.25), (0.5, 0.5), (1.0, 1.0)]
 
 class ExitStrategy:
     """Base class for exit strategies"""
@@ -97,12 +99,8 @@ class ScaledExitStrategy(ExitStrategy):
     
     def __init__(self, exit_levels=None):
         super().__init__("scaled_exit")
-        # Default scaling: 25% at +20%, 50% at +50%, 100% at +100%
-        self.exit_levels = exit_levels or [
-            (0.2, 0.25),   # 25% at +20%
-            (0.5, 0.5),    # 50% at +50%
-            (1.0, 1.0),    # 100% at +100%
-        ]
+        # Use config tiers or fallback
+        self.exit_levels = exit_levels or SCALED_EXIT_TIERS
         
     def should_exit(self, position, current_price):
         entry_price = position.get('entry_price', 0)
@@ -111,20 +109,28 @@ class ScaledExitStrategy(ExitStrategy):
         
         pnl_percent = (current_price - entry_price) / entry_price
         
-        # Track what's already been sold
+        # Initialize remaining tokens tracking
+        if 'remaining_tokens' not in position:
+            position['remaining_tokens'] = position.get('actual_tokens', position.get('expected_tokens', 0))
         if 'total_sold_ratio' not in position:
             position['total_sold_ratio'] = 0.0
         
-        # Check each exit level
-        for profit_threshold, exit_ratio in self.exit_levels:
+        # Check if position is already mostly closed
+        if position['total_sold_ratio'] >= 0.99 or position['remaining_tokens'] < 100:
+            return False, "position_closed", 0.0
+        
+        # Check each exit level based on remaining position
+        for profit_threshold, target_exit_ratio in self.exit_levels:
             if pnl_percent >= profit_threshold:
-                remaining_ratio = exit_ratio - position['total_sold_ratio']
+                remaining_ratio = target_exit_ratio - position['total_sold_ratio']
                 if remaining_ratio > 0.01:  # At least 1% to make it worthwhile
                     return True, f"scaled_exit_{profit_threshold*100:.0f}%", remaining_ratio
         
-        # Stop-loss
+        # Stop-loss for remaining position
         if pnl_percent <= -STOP_LOSS:
-            return True, "stop_loss", 1.0 - position['total_sold_ratio']
+            remaining_ratio = 1.0 - position['total_sold_ratio']
+            if remaining_ratio > 0.01:
+                return True, "stop_loss", remaining_ratio
         
         return False, "hold", 0.0
 
@@ -202,7 +208,7 @@ class ExitStrategyManager:
             'time_based': TimeBasedExitStrategy(),
             'adaptive': AdaptiveExitStrategy()
         }
-        self.default_strategy = 'adaptive'
+        self.default_strategy = 'scaled' if SCALED_EXIT_ENABLED else 'adaptive'
     
     def get_exit_decision(self, position, current_price, strategy_name=None):
         """Get exit decision for a position"""
@@ -217,6 +223,10 @@ class ExitStrategyManager:
             position['exit_strategy'] = strategy_name
             return True
         return False
+    
+    def get_available_strategies(self):
+        """Get list of available strategy names"""
+        return list(self.strategies.keys())
 
 # Global exit strategy manager
 exit_manager = ExitStrategyManager()

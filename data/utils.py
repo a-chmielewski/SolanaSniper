@@ -1,7 +1,14 @@
 import pandas as pd
 import time
+import json
 from datetime import datetime, timedelta
-from config import MIN_MCAP, MAX_MCAP, MIN_LIQUIDITY, MIN_VOLUME_24H, MAX_LAST_TRADE_MINUTES
+from config import (
+    MIN_MCAP, MAX_MCAP, MIN_LIQUIDITY, MIN_VOLUME_24H, MAX_LAST_TRADE_MINUTES,
+    VOLUME_SCORE_DIVISOR, MCAP_SCORE_DIVISOR, LIQUIDITY_SCORE_DIVISOR,
+    LOW_LIQUIDITY_THRESHOLD, LOW_VOLUME_THRESHOLD, VOLUME_BURST_HIGH,
+    VOLUME_BURST_MED, VOLUME_BURST_LOW, PRICE_MOMENTUM_DIVISOR,
+    FILTER_STATS_WINDOW, FILTER_TUNE_FREQUENCY, FILTER_SUCCESS_TARGET
+)
 
 # Known established tokens to exclude from sniping
 EXCLUDED_TOKENS = {
@@ -22,6 +29,12 @@ class TokenFilter:
         self.min_liquidity = MIN_LIQUIDITY
         self.min_volume_24h = MIN_VOLUME_24H
         self.max_last_trade_minutes = MAX_LAST_TRADE_MINUTES
+        
+        # Filter performance tracking
+        self.filter_outcomes = []
+        self.last_tune_count = 0
+        self.stats_file = 'logs/filter_performance.json'
+        self._load_filter_stats()
     
     def is_new_token(self, token_data):
         """Check if token is new (created recently)"""
@@ -40,11 +53,10 @@ class TokenFilter:
         hours_since_creation = (current_time - created_timestamp) / 3600
         return hours_since_creation <= 24
 
-    def has_recent_trades(self, token_data):
-        """Check if token has recent trading activity"""
-        # DexScreener doesn't provide last_trade_ts, so check volume instead
+    def has_volume_activity(self, token_data):
+        """Check if token has volume activity"""
         volume_24h = token_data.get('volume_24h', 0)
-        return volume_24h > 0  # Any volume indicates recent activity
+        return volume_24h > 0
 
     def meets_market_cap_criteria(self, token_data):
         """Check if token meets market cap criteria"""
@@ -116,8 +128,8 @@ class TokenFilter:
             volume = token_data.get('volume_24h', 0)
             return False, f"24h volume {volume} below minimum {self.min_volume_24h}"
         
-        if not self.has_recent_trades(token_data):
-            return False, "No recent volume"
+        if not self.has_volume_activity(token_data):
+            return False, "No volume activity"
         
         return True, "Passed all filters"
 
@@ -131,7 +143,7 @@ class TokenFilter:
             'market_cap_filtered': 0,
             'liquidity_filtered': 0,
             'volume_filtered': 0,
-            'no_recent_trades': 0,
+            'no_volume': 0,
             'passed': 0
         }
         
@@ -164,10 +176,104 @@ class TokenFilter:
                     volume = token.get('volume_24h', 0)
                     if volume > 0:  # Only count when volume is known
                         filter_stats['volume_filtered'] += 1
-                elif 'No recent volume' in reason:
-                    filter_stats['no_recent_trades'] += 1
+                elif 'No volume activity' in reason:
+                    filter_stats['no_volume'] += 1
         
         return candidates, filter_stats
+    
+    def record_outcome(self, token_address, filtered_in, trade_success):
+        """Record filter outcome for performance tracking"""
+        outcome = {
+            'timestamp': time.time(),
+            'address': token_address,
+            'filtered_in': filtered_in,
+            'trade_success': trade_success,
+            'thresholds': {
+                'min_mcap': self.min_mcap,
+                'min_liquidity': self.min_liquidity,
+                'min_volume_24h': self.min_volume_24h
+            }
+        }
+        
+        self.filter_outcomes.append(outcome)
+        
+        # Keep only recent outcomes
+        if len(self.filter_outcomes) > FILTER_STATS_WINDOW:
+            self.filter_outcomes = self.filter_outcomes[-FILTER_STATS_WINDOW:]
+        
+        self._save_filter_stats()
+        
+        # Auto-tune thresholds periodically
+        if len(self.filter_outcomes) - self.last_tune_count >= FILTER_TUNE_FREQUENCY:
+            self._auto_tune_thresholds()
+            self.last_tune_count = len(self.filter_outcomes)
+    
+    def _load_filter_stats(self):
+        """Load filter performance stats from file"""
+        try:
+            with open(self.stats_file, 'r') as f:
+                data = json.load(f)
+                self.filter_outcomes = data.get('outcomes', [])
+                self.last_tune_count = data.get('last_tune_count', 0)
+        except FileNotFoundError:
+            pass
+    
+    def _save_filter_stats(self):
+        """Save filter performance stats to file"""
+        import os
+        os.makedirs('logs', exist_ok=True)
+        with open(self.stats_file, 'w') as f:
+            json.dump({
+                'outcomes': self.filter_outcomes,
+                'last_tune_count': self.last_tune_count
+            }, f)
+    
+    def _auto_tune_thresholds(self):
+        """Auto-tune filter thresholds based on outcomes"""
+        if len(self.filter_outcomes) < 20:
+            return
+        
+        # Calculate success rate of filtered-in tokens
+        filtered_in = [o for o in self.filter_outcomes if o['filtered_in']]
+        if not filtered_in:
+            return
+        
+        success_rate = sum(1 for o in filtered_in if o['trade_success']) / len(filtered_in)
+        
+        # Adjust thresholds based on success rate vs target
+        if success_rate < FILTER_SUCCESS_TARGET:
+            # Too many low-quality tokens passing, tighten filters
+            self.min_mcap = min(self.min_mcap * 1.2, 2000)
+            self.min_liquidity = min(self.min_liquidity * 1.15, 15000)
+            self.min_volume_24h = min(self.min_volume_24h * 1.15, 10000)
+        elif success_rate > FILTER_SUCCESS_TARGET * 1.5:
+            # Success rate too high, might be over-pruning, relax slightly
+            self.min_mcap = max(self.min_mcap * 0.9, 200)
+            self.min_liquidity = max(self.min_liquidity * 0.95, 2000)
+            self.min_volume_24h = max(self.min_volume_24h * 0.95, 2000)
+        
+        print(f"Auto-tuned thresholds: mcap={self.min_mcap}, liq={self.min_liquidity}, vol={self.min_volume_24h} (success_rate={success_rate:.2f})")
+    
+    def get_filter_performance(self):
+        """Get current filter performance metrics"""
+        if not self.filter_outcomes:
+            return {}
+        
+        filtered_in = [o for o in self.filter_outcomes if o['filtered_in']]
+        total_trades = len(filtered_in)
+        successful_trades = sum(1 for o in filtered_in if o['trade_success'])
+        
+        return {
+            'total_outcomes': len(self.filter_outcomes),
+            'total_trades': total_trades,
+            'successful_trades': successful_trades,
+            'success_rate': successful_trades / total_trades if total_trades > 0 else 0,
+            'current_thresholds': {
+                'min_mcap': self.min_mcap,
+                'min_liquidity': self.min_liquidity,
+                'min_volume_24h': self.min_volume_24h
+            }
+        }
 
 def calculate_token_score(token_data):
     """Calculate a score for token ranking"""
@@ -176,50 +282,60 @@ def calculate_token_score(token_data):
     # Volume score (higher volume = higher score)
     volume_24h = token_data.get('volume_24h', 0)
     if volume_24h > 0:
-        score += min(volume_24h / 10000, 10)  # Max 10 points for volume
+        score += min(volume_24h / VOLUME_SCORE_DIVISOR, 10)
     
     # Market cap score (prefer FDV if marketCap missing)
     market_cap = token_data.get('market_cap', 0)
     fdv = token_data.get('fdv', 0)
     cap_value = market_cap if market_cap > 0 else fdv
     if cap_value > 0:
-        score += min(cap_value / 100000, 5)  # Max 5 points for cap
+        score += min(cap_value / MCAP_SCORE_DIVISOR, 5)
     
     # Liquidity score with penalty for low liquidity
     liquidity = token_data.get('liquidity', 0)
-    if liquidity >= 10000:
-        score += min(liquidity / 50000, 5)  # Max 5 points for liquidity
+    if liquidity >= LOW_LIQUIDITY_THRESHOLD:
+        score += min(liquidity / LIQUIDITY_SCORE_DIVISOR, 5)
     elif liquidity > 0:
-        score -= 2  # Penalty for low liquidity
+        score -= 2
     
     # Volume penalty for very low volume
-    if volume_24h > 0 and volume_24h < 20000:
+    if volume_24h > 0 and volume_24h < LOW_VOLUME_THRESHOLD:
         score -= 1
     
-    # Recent activity score (based on volume since no last_trade_ts)
-    if volume_24h > 100000:  # High volume
-        score += 5
-    elif volume_24h > 50000:  # Medium volume
-        score += 3
-    elif volume_24h > 10000:  # Low volume
-        score += 1
+    # Volume burst proxy - high volume relative to market cap indicates activity burst
+    if market_cap > 0 and volume_24h > 0:
+        volume_mcap_ratio = volume_24h / market_cap
+        if volume_mcap_ratio > VOLUME_BURST_HIGH:
+            score += 5
+        elif volume_mcap_ratio > VOLUME_BURST_MED:
+            score += 3
+        elif volume_mcap_ratio > VOLUME_BURST_LOW:
+            score += 1
     
     # Price change score (positive momentum)
     price_change = token_data.get('price_24h_change', 0)
     if price_change > 0:
-        score += min(price_change / 10, 3)  # Max 3 points for price momentum
+        score += min(price_change / PRICE_MOMENTUM_DIVISOR, 3)
+    
+    # Price burst proxy - significant price change indicates momentum
+    price_change_abs = abs(price_change)
+    if price_change_abs > 20:
+        score += 3
+    elif price_change_abs > 10:
+        score += 2
+    elif price_change_abs > 5:
+        score += 1
     
     # Quote token preference (if available in token data)
     quote_symbol = token_data.get('quote_symbol', '').upper()
     if quote_symbol in ('USDC', 'SOL', 'WSOL'):
         score += 2
     
-    # Pair age scoring (if available)
+    # New token bonus (if available)
     created_at = token_data.get('created_at', 0)
     if created_at > 0:
-        import time
-        age_minutes = (time.time() - created_at) / 60
-        if 2 <= age_minutes <= 180:  # 2 min to 3 hours
+        age_hours = (time.time() - created_at) / 3600
+        if age_hours <= 24:
             score += 2
     
     return score
@@ -245,12 +361,22 @@ def format_token_summary(token_data):
         'liquidity': f"${token_data.get('liquidity', 0):,.0f}",
         'volume_24h': f"${token_data.get('volume_24h', 0):,.0f}",
         'price_change_24h': f"{token_data.get('price_24h_change', 0):+.2f}%",
-        'last_trade_minutes_ago': get_minutes_since_last_trade(token_data)
+        'volume_burst': get_volume_burst_indicator(token_data)
     }
 
-def get_minutes_since_last_trade(token_data):
-    """Get minutes since last trade - DexScreener doesn't provide this"""
-    return "N/A"  # DexScreener doesn't provide last trade timestamp
+def get_volume_burst_indicator(token_data):
+    """Get volume burst indicator"""
+    volume_24h = token_data.get('volume_24h', 0)
+    market_cap = token_data.get('market_cap', 0)
+    if market_cap > 0 and volume_24h > 0:
+        ratio = volume_24h / market_cap
+        if ratio > 0.5:
+            return "HIGH"
+        elif ratio > 0.2:
+            return "MED"
+        elif ratio > 0.05:
+            return "LOW"
+    return "NONE"
 
 def save_candidates_to_csv(candidates, filename=None):
     """Save filtered candidates to CSV file"""

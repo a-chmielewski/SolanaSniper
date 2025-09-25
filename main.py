@@ -10,7 +10,7 @@ import sys
 from datetime import datetime
 
 # Import all modules
-from config import WALLET_PRIVATE_KEY
+from config import WALLET_PRIVATE_KEY, MAX_CONCURRENT_BUYS
 from data.price_manager import price_manager
 from strategy.filters import get_sniper_candidates
 from strategy.sniper_strategy import sniper_strategy
@@ -65,29 +65,56 @@ class SolanaSniper:
                 sniper_logger.log_info("No candidates found")
                 return
             
-            for candidate in candidates:
-                self.evaluate_candidate(candidate)
+            # Rank candidates by signal strength
+            ranked_candidates = self.rank_candidates(candidates)
+            
+            # Execute buys for top candidates up to MAX_CONCURRENT_BUYS
+            buys_executed = 0
+            for candidate in ranked_candidates:
+                if buys_executed >= MAX_CONCURRENT_BUYS:
+                    break
+                if self.evaluate_and_buy(candidate):
+                    buys_executed += 1
+                    
         except Exception as e:
             sniper_logger.log_error(f"Scan failed: {e!r}")
     
-    def evaluate_candidate(self, token_data):
+    def rank_candidates(self, candidates):
+        """Rank candidates by signal strength"""
+        candidates_with_signals = []
+        for candidate in candidates:
+            try:
+                signal_strength = sniper_strategy.get_entry_signals(candidate)
+                candidate['signal_strength'] = signal_strength
+                candidates_with_signals.append(candidate)
+            except Exception as e:
+                sniper_logger.log_error(f"Error calculating signal for {candidate.get('symbol', 'UNKNOWN')}: {str(e)}")
+        
+        # Sort by signal strength descending
+        return sorted(candidates_with_signals, key=lambda x: x.get('signal_strength', 0), reverse=True)
+    
+    def evaluate_and_buy(self, token_data):
+        """Evaluate candidate and execute buy if conditions are met. Returns True if buy was executed."""
         token_symbol = token_data.get('symbol', 'UNKNOWN')
+        signal_strength = token_data.get('signal_strength', 0)
         
         try:
-            signal_strength = sniper_strategy.get_entry_signals(token_data)
-            token_data['signal_strength'] = signal_strength  # Store for logging
             should_buy, reason = sniper_strategy.should_buy(token_data)
             
             if should_buy:
                 sniper_logger.log_info(f"✅ Buy signal: {token_symbol} (Signal: {signal_strength}/100)")
                 sniper_logger.log_market_opportunity(token_symbol, signal_strength, reason)
-                self.execute_buy(token_data)
+                return self.execute_buy(token_data)
             else:
                 sniper_logger.log_info(f"❌ Skip: {token_symbol} - {reason} (Signal: {signal_strength}/100)")
+                return False
         except Exception as e:
             sniper_logger.log_error(f"Error evaluating {token_symbol}: {str(e)}")
+            return False
+    
     
     def execute_buy(self, token_data):
+        """Execute buy and return True if successful"""
         token_symbol = token_data.get('symbol', 'UNKNOWN')
         token_address = token_data.get('address')
         
@@ -95,17 +122,17 @@ class SolanaSniper:
             # Check for duplicate position
             if token_address in trade_manager.active_positions:
                 sniper_logger.log_warning(f"🚧 Already holding {token_symbol}, skipping duplicate buy")
-                return
+                return False
             
             active_count = len(trade_manager.get_active_positions())
             if active_count >= 5:
                 sniper_logger.log_warning("Position limit reached")
-                return
+                return False
             
             # Check for in-flight buy
             if trade_manager.in_flight_buy:
                 sniper_logger.log_info("Skip buy: another buy is in-flight")
-                return
+                return False
             
             trade_manager.in_flight_buy = True
             try:
@@ -120,10 +147,13 @@ class SolanaSniper:
                 alert_system.alert_trade_executed('buy', token_symbol, position.get('sol_amount', 0), position.get('entry_price', 0))
                 # Refresh balance after successful buy for next candidate
                 trade_manager.wallet = load_wallet()
+                return True
             else:
                 sniper_logger.log_error(f"Buy failed: {result.get('error')}")
+                return False
         except Exception as e:
             sniper_logger.log_error(f"Execute buy failed: {str(e)}")
+            return False
     
     def monitor_positions(self):
         try:
