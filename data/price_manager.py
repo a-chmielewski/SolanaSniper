@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta
 # BirdEye API removed - using Jupiter for SOL pricing
 from data.jupiter_api import jupiter_api
+from data.oracle_client import oracle_client
 
 class PriceManager:
     def __init__(self):
@@ -35,9 +36,18 @@ class PriceManager:
         return self.sol_price_cache or self.fallback_sol_price
     
     def _fetch_sol_price(self):
-        """Fetch SOL price using Jupiter quotes"""
+        """Fetch SOL price using oracle feeds with Jupiter fallback"""
         
-        # Method 1: Jupiter USDC->SOL quote (reverse calculation)
+        # Method 1: Oracle feeds (Pyth/Chainlink)
+        try:
+            oracle_price = oracle_client.get_sol_price()
+            if oracle_price and oracle_price > 0:
+                print(f"📊 SOL price from Oracle: ${oracle_price:.2f}")
+                return oracle_price
+        except Exception as e:
+            print(f"Oracle SOL price failed: {e}")
+        
+        # Method 2: Jupiter USDC->SOL quote (reverse calculation)
         try:
             # Quote 100 USDC for SOL to get price
             usdc_amount = 100

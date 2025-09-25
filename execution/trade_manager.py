@@ -1,3 +1,22 @@
+"""
+Trade Manager - Core trading execution and position management
+
+This module handles all trading operations including:
+- Executing sniper buys with proper balance management and fee buffers
+- Dynamic exit strategies using trailing stops and adaptive thresholds
+- Sell retry logic with escalating slippage and route simplification
+- Position monitoring with resilient API calls
+- Chunked selling for large positions to reduce price impact
+- Priority fee handling for competitive transaction execution
+
+Key Features:
+- In-flight buy protection to prevent over-leveraging small balances
+- Adaptive liquidity/volume thresholds based on entry conditions
+- Jupiter error detection and retry with route optimization
+- Actual SOL P&L tracking vs price-based calculations
+- Failed DEX tracking and exclusion for problematic routes
+"""
+
 import time
 from datetime import datetime
 from data.jupiter_api import jupiter_api, SOL_MINT
@@ -5,16 +24,45 @@ from data.dexscreener_api import dexscreener_api
 from data.price_manager import price_manager
 from execution.wallet import load_wallet
 from config import BUY_AMOUNT_USD, TARGET_PROFIT, STOP_LOSS
+from strategy.exit_strategies import exit_manager
+from data.api_client import api_client
 
 class TradeManager:
+    """
+    Manages all trading operations with advanced risk management and retry logic.
+    
+    Attributes:
+        wallet: Loaded wallet instance for transaction signing
+        active_positions: Dict of currently open positions by token address
+        trade_history: List of all completed trades and actions
+        in_flight_buy: Flag to prevent concurrent buys on small balances
+        failed_dexes: Dict tracking DEXes that consistently fail for specific tokens
+    """
+    
     def __init__(self):
         self.wallet = load_wallet()
         self.active_positions = {}
         self.trade_history = []
-        self.in_flight_buy = False
+        self.in_flight_buy = False  # Prevents concurrent buys
+        self.failed_dexes = {}  # Track problematic DEXes per token
     
     def execute_sniper_buy(self, token_data):
-        """Execute buy order for sniping"""
+        """
+        Execute a sniper buy with comprehensive balance management and safety checks.
+        
+        Features:
+        - Refreshes wallet balance and calculates spendable SOL after fee buffers
+        - Reserves SOL for transaction fees, ATA creation, and minimum residual
+        - Caps buy amount to available balance to prevent insufficient funds errors
+        - Records position with adaptive thresholds based on entry conditions
+        - Provides detailed preflight logging for debugging
+        
+        Args:
+            token_data: Dict containing token information (address, symbol, price, etc.)
+            
+        Returns:
+            Dict with 'success' key and position data, or 'error' key with message
+        """
         token_address = token_data.get('address')
         token_symbol = token_data.get('symbol', 'UNKNOWN')
         
@@ -90,7 +138,10 @@ class TradeManager:
             # Get token decimals from BirdEye data
             token_decimals = token_data.get('decimals', 9)
             
-            # Record position with pending status
+            # Record position with pending status and adaptive thresholds
+            initial_liquidity = token_data.get('liquidity', 0)
+            initial_volume = token_data.get('volume_24h', 0)
+            
             position = {
                 'token_address': token_address,
                 'token_symbol': token_symbol,
@@ -103,7 +154,12 @@ class TradeManager:
                 'expected_tokens': float(quote.get('outAmount', 0)),
                 'tx_id': tx_id,
                 'status': 'pending',
-                'confirmation_attempts': 0
+                'confirmation_attempts': 0,
+                # Adaptive thresholds based on entry conditions
+                'initial_liquidity': initial_liquidity,
+                'initial_volume_24h': initial_volume,
+                'liquidity_drop_threshold': max(5000, initial_liquidity * 0.3),  # 30% of initial or $5k min
+                'volume_drop_threshold': max(10000, initial_volume * 0.2)  # 20% of initial or $10k min
             }
             
             self.active_positions[token_address] = position
@@ -116,57 +172,103 @@ class TradeManager:
             return {"error": f"Buy execution failed: {str(e)}"}
     
     def should_sell_position(self, position_data):
-        """Determine if position should be sold - consolidated logic"""
+        """
+        Determine if a position should be sold using dynamic exit strategies and resilient data fetching.
+        
+        Features:
+        - Uses exit_manager for trailing stops and scaled exits
+        - Adaptive liquidity/volume thresholds based on entry conditions
+        - Resilient API calls with caching and fallbacks
+        - Graceful handling of data unavailability without forced sells
+        
+        Args:
+            position_data: Dict containing position information
+            
+        Returns:
+            Tuple of (should_sell: bool, reason: str, exit_ratio: float)
+        """
         entry_price = position_data.get('entry_price', 0)
         entry_time = position_data.get('entry_time')
         token_address = position_data.get('token_address')
         
         if not all([entry_price, entry_time, token_address]):
-            return True, "missing_data"
+            return True, "missing_data", 1.0
         
-        # Get current price
-        current_price = dexscreener_api.get_price(token_address)
+        # Get current price with resilient API call
+        def get_price_safe():
+            return dexscreener_api.get_price(token_address)
+        
+        current_price = api_client.resilient_request(
+            get_price_safe, 
+            cache_key=f"price_{token_address}"
+        )
+        
         if not current_price:
-            return True, "no_price_data"
+            # Don't force sell on price data failure - use cached or skip this check
+            print(f"⚠️ Price data unavailable for {token_address}, skipping price-based exit checks")
+            return False, "price_data_unavailable", 0.0
         
-        # Calculate P&L
-        pnl_percent = (current_price - entry_price) / entry_price
-        
-        # Take profit
-        if pnl_percent >= TARGET_PROFIT:
-            return True, "take_profit"
-        
-        # Stop loss
-        if pnl_percent <= -STOP_LOSS:
-            return True, "stop_loss"
-        
-        # Time-based exit (30 minutes max hold)
-        time_held = (datetime.now() - entry_time).total_seconds() / 60
-        if time_held > 30:
-            return True, "time_limit"
-        
-        # Liquidity check (rug protection)
-        pairs = dexscreener_api.get_token_info(token_address)
-        best_pair = dexscreener_api._pick_best_pair(pairs)
-        current_liquidity = 0
-        if best_pair:
-            current_liquidity = float((best_pair.get('liquidity') or {}).get('usd', 0))
-        
-        if current_liquidity < 5000:  # Less than $5k liquidity left
-            return True, "liquidity_drop"
-        
-        # Check for negative momentum - simplified without recent trades
-        if pnl_percent < -0.05 and time_held > 5:  # -5% after 5 minutes
-            # DexScreener doesn't provide recent trades, so use volume as proxy
-            volume_24h = 0
+        # Adaptive liquidity check (rug protection) - priority check with resilience
+        def get_liquidity_safe():
+            pairs = dexscreener_api.get_token_info(token_address)
+            best_pair = dexscreener_api._pick_best_pair(pairs)
             if best_pair:
-                volume_data = best_pair.get('volume', {})
-                volume_24h = float(volume_data.get('h24', 0))
-            
-            if volume_24h < 10000:  # Very low volume
-                return True, "low_activity"
+                return float((best_pair.get('liquidity') or {}).get('usd', 0))
+            return 0
         
-        return False, "hold"
+        current_liquidity = api_client.resilient_request(
+            get_liquidity_safe,
+            cache_key=f"liquidity_{token_address}"
+        )
+        
+        if current_liquidity is None:
+            # Don't force sell on liquidity data failure
+            print(f"⚠️ Liquidity data unavailable for {token_address}, using fallback threshold")
+            current_liquidity = position_data.get('initial_liquidity', 50000) * 0.5  # Assume 50% of initial
+        
+        # Use adaptive threshold based on entry liquidity
+        liquidity_threshold = position_data.get('liquidity_drop_threshold', 5000)
+        if current_liquidity < liquidity_threshold:
+            return True, "liquidity_drop", 1.0
+        
+        # Use dynamic exit strategy
+        should_exit, reason, exit_ratio = exit_manager.get_exit_decision(position_data, current_price)
+        
+        if should_exit:
+            return True, reason, exit_ratio
+        
+        # Additional safety checks for very low activity
+        pnl_percent = (current_price - entry_price) / entry_price
+        time_held = (datetime.now() - entry_time).total_seconds() / 60
+        
+        # Adaptive momentum check based on entry conditions
+        momentum_drop_threshold = min(0.05, abs(pnl_percent) * 0.5)  # Adaptive based on current loss
+        if pnl_percent < -momentum_drop_threshold and time_held > 5:
+            # Get volume data with resilience
+            def get_volume_safe():
+                pairs = dexscreener_api.get_token_info(token_address)
+                best_pair = dexscreener_api._pick_best_pair(pairs)
+                if best_pair:
+                    volume_data = best_pair.get('volume', {})
+                    return float(volume_data.get('h24', 0))
+                return 0
+            
+            volume_24h = api_client.resilient_request(
+                get_volume_safe,
+                cache_key=f"volume_{token_address}"
+            )
+            
+            if volume_24h is None:
+                # Don't force sell on volume data failure
+                print(f"⚠️ Volume data unavailable for {token_address}, skipping low activity check")
+                volume_24h = position_data.get('initial_volume_24h', 20000)  # Use initial as fallback
+            
+            # Use adaptive volume threshold
+            volume_threshold = position_data.get('volume_drop_threshold', 10000)
+            if volume_24h < volume_threshold:
+                return True, "low_activity", 1.0
+        
+        return False, "hold", 0.0
 
     def confirm_pending_transactions(self):
         """Confirm pending transactions and update position status"""
@@ -234,122 +336,546 @@ class TradeManager:
             if position.get('status') != 'open':
                 continue
                 
-            should_sell, reason = self.should_sell_position(position)
+            should_sell, reason, exit_ratio = self.should_sell_position(position)
             if should_sell:
-                positions_to_sell.append((token_address, reason))
+                positions_to_sell.append((token_address, reason, exit_ratio))
         
         # Execute sells
         results = []
-        for token_address, reason in positions_to_sell:
-            result = self.execute_sniper_sell(token_address, reason)
+        for token_address, reason, exit_ratio in positions_to_sell:
+            if exit_ratio < 1.0:
+                # Partial exit
+                result = self.execute_partial_sell(token_address, reason, exit_ratio)
+            else:
+                # Full exit
+                result = self.execute_sniper_sell(token_address, reason)
             results.append(result)
         
         return results
 
-    def execute_sniper_sell(self, token_address, reason="manual"):
-        """Execute sell order for position"""
+    def execute_sniper_sell(self, token_address, reason="manual", max_retries=3):
+        """
+        Execute a complete sell with advanced retry logic and route optimization.
+        
+        Features:
+        - Sells 99.5% of balance initially, reducing on retries to avoid dust issues
+        - Escalating slippage tolerance on retries (0.5% → 1.0% → 1.5%)
+        - Route simplification: reduces maxAccounts and prefers direct routes on retries
+        - Jupiter error detection with specific handling for transient errors
+        - Fresh quote validation to ensure quotes aren't stale before execution
+        - Actual SOL P&L calculation based on received amounts
+        - Automatic chunked selling for high price impact scenarios
+        
+        Args:
+            token_address: Token contract address to sell
+            reason: Reason for selling (for tracking)
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            Dict with 'success' key and position data, or 'error' key with message
+        """
         if token_address not in self.active_positions:
             return {"error": "No active position found"}
         
         position = self.active_positions[token_address]
         token_symbol = position['token_symbol']
-        sell_tx_sent = False
-        sell_tx_id = None
         
-        try:
-            # Get current token balance
-            token_balance = self.wallet.get_token_balance(token_address)
-            if token_balance <= 0:
-                return {"error": "No tokens to sell"}
-            
-            # Get token decimals from position data (stored from buy)
-            token_decimals = position.get('token_decimals', 9)
-            
-            # Get quote for token to SOL using correct decimals
-            quote = jupiter_api.get_token_to_sol_quote(
-                token_address, 
-                token_balance, 
-                token_decimals
-            )
-            
-            if not quote:
-                return {"error": "Failed to get sell quote"}
-            
-            # Get swap transaction
-            swap_tx = jupiter_api.get_swap_transaction(quote, self.wallet.get_address())
-            if not swap_tx:
-                return {"error": "Failed to create sell transaction"}
-            
-            # Sign and send transaction
-            signed_tx = self.wallet.sign_transaction(swap_tx.get('swapTransaction'))
-            if not signed_tx:
-                return {"error": "Failed to sign sell transaction"}
-            
-            result = self.wallet.send_transaction(signed_tx)
-            if result.get('error'):
-                return result
-            
-            # Transaction sent successfully - mark it
-            sell_tx_sent = True
-            sell_tx_id = result.get('tx_id')
-            
-        except Exception as e:
-            # If transaction was sent but post-processing failed, still remove position
-            if sell_tx_sent:
+        # Record SOL balance before sell
+        initial_sol_balance = self.wallet.get_sol_balance()
+        
+        for attempt in range(max_retries):
+            try:
+                # Get current token balance and reduce by dust factor
+                full_token_balance = self.wallet.get_token_balance(token_address)
+                if full_token_balance <= 0:
+                    return {"error": "No tokens to sell"}
+                
+                # Sell 99.5% on first attempt, reduce by 0.5-1.0% on retries to avoid dust/rounding
+                dust_reduction = 0.995 - (attempt * 0.005)  # 99.5%, 99.0%, 98.5%
+                token_balance = int(full_token_balance * dust_reduction)
+                
+                if token_balance <= 0:
+                    return {"error": "Token balance too small after dust reduction"}
+                
+                # Get token decimals from position data
+                token_decimals = position.get('token_decimals', 9)
+                
+                # Check if we should chunk the sell to reduce impact
+                should_chunk, chunk_size = self._should_chunk_sell(token_balance, position)
+                
+                if should_chunk:
+                    return self._execute_chunked_sell(token_address, reason, chunk_size, max_retries)
+                
+                # Fresh quote with escalating slippage for Jupiter errors
+                base_slippage = 50 + (attempt * 50)  # 0.5%, 1.0%, 1.5% for retries
+                # Cap at 500 bps (5%) for micro-caps
+                slippage_bps = min(base_slippage, 500)
+                
+                # Get fresh quote immediately before swap, excluding problematic DEXes
+                exclude_dexes = self.failed_dexes.get(token_address, [])
+                # Simplify routes for problematic tokens on retries
+                max_accounts = 64 - (attempt * 16) if attempt > 0 else None  # Reduce complexity on retries
+                prefer_direct = attempt >= 2  # Prefer direct routes on final attempts
+                
+                quote = jupiter_api.get_token_to_sol_quote(
+                    token_address, 
+                    token_balance, 
+                    token_decimals,
+                    slippage_bps=slippage_bps,
+                    dynamic_slippage=True,
+                    exclude_dexes=exclude_dexes if exclude_dexes else None,
+                    max_accounts=max_accounts,
+                    prefer_direct=prefer_direct
+                )
+                
+                if not quote:
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Quote failed for {token_symbol}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(1)
+                        continue
+                    return {"error": "Failed to get sell quote after retries"}
+                
+                # Check price impact before proceeding
+                price_impact = float(quote.get('priceImpactPct', 0))
+                max_impact = 5.0 + (attempt * 2.0)  # Allow higher impact on retries
+                
+                if price_impact > max_impact:
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ High price impact {price_impact:.2f}% for {token_symbol}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(2)
+                        continue
+                    # On final attempt, try chunked sell if impact is too high
+                    if price_impact > 10.0:
+                        print(f"⚠️ Very high impact {price_impact:.2f}%, attempting chunked sell")
+                        return self._execute_chunked_sell(token_address, reason, token_balance // 3, max_retries)
+                
+                # Get swap transaction immediately after fresh quote
+                swap_tx = jupiter_api.get_swap_transaction(quote, self.wallet.get_address())
+                if not swap_tx:
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Swap tx failed for {token_symbol}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(1)
+                        continue
+                    return {"error": "Failed to create sell transaction after retries"}
+                
+                # Validate quote is still fresh (Jupiter recommendation)
+                quote_age_ms = (time.time() * 1000) - quote.get('timeTaken', time.time() * 1000)
+                if quote_age_ms > 2000:  # Quote older than 2 seconds
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Quote stale ({quote_age_ms:.0f}ms) for {token_symbol}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(0.5)
+                        continue
+                
+                # Sign and send transaction
+                signed_tx = self.wallet.sign_transaction(swap_tx.get('swapTransaction'))
+                if not signed_tx:
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Sign failed for {token_symbol}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(1)
+                        continue
+                    return {"error": "Failed to sign sell transaction after retries"}
+                
+                result = self.wallet.send_transaction(signed_tx)
+                if result.get('error'):
+                    error_msg = result.get('error', '')
+                    
+                    # Check for Jupiter-specific transient errors
+                    jupiter_errors = ['6001', '6017', '6024', '0x1771', '0x1781', '0x1788']
+                    is_jupiter_error = any(err_code in str(error_msg) for err_code in jupiter_errors)
+                    is_jupiter_program = 'JUP6' in str(error_msg) or 'Jupiter' in str(error_msg)
+                    
+                    if is_jupiter_error and is_jupiter_program and attempt < max_retries - 1:
+                        print(f"⚠️ Jupiter transient error {error_msg}, re-quoting with higher slippage {attempt + 1}/{max_retries}")
+                        # Break out of current attempt to re-quote with higher slippage
+                        time.sleep(1)
+                        continue
+                    
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Send failed for {token_symbol}: {error_msg}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(2)
+                        continue
+                    return result
+                
+                # Transaction successful
+                sell_tx_id = result.get('tx_id')
+                
+                # Wait and measure actual SOL received
+                time.sleep(3)  # Wait for confirmation
+                final_sol_balance = self.wallet.get_sol_balance()
+                actual_sol_received = final_sol_balance - initial_sol_balance
+                
+                # Calculate true P&L based on actual SOL received
+                sol_invested = position.get('sol_amount', 0)
+                sol_pnl = actual_sol_received - sol_invested
+                sol_pnl_percent = (sol_pnl / sol_invested) * 100 if sol_invested > 0 else 0
+                
+                # Get price-based P&L for comparison with resilience
+                def get_exit_price_safe():
+                    return dexscreener_api.get_price(token_address)
+                
+                current_price = api_client.resilient_request(
+                    get_exit_price_safe,
+                    cache_key=f"exit_price_{token_address}"
+                ) or 0
+                
+                entry_price = position['entry_price']
+                price_pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                
+                # Update position with comprehensive data
+                position.update({
+                    'exit_time': datetime.now(),
+                    'exit_price': current_price,
+                    'pnl_percent': price_pnl_percent,
+                    'actual_sol_received': actual_sol_received,
+                    'sol_pnl': sol_pnl,
+                    'sol_pnl_percent': sol_pnl_percent,
+                    'exit_reason': reason,
+                    'status': 'closed',
+                    'sell_tx_id': sell_tx_id,
+                    'sell_attempts': attempt + 1
+                })
+                
+                print(f"✅ Sold {token_symbol}: {sol_pnl_percent:+.2f}% SOL P&L ({price_pnl_percent:+.2f}% price P&L)")
+                
+                # Remove from active positions and add to history
+                self.trade_history.append({**position, 'action': 'sell'})
+                del self.active_positions[token_address]
+                
+                return {"success": True, "position": position}
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"⚠️ Sell attempt {attempt + 1} failed for {token_symbol}: {e}, retrying...")
+                    time.sleep(2)
+                    continue
+                
+                # All retries failed
                 position.update({
                     'exit_time': datetime.now(),
                     'exit_price': 0,
                     'pnl_percent': 0,
-                    'exit_reason': f"{reason}_error",
-                    'status': 'closed',
-                    'sell_tx_id': sell_tx_id,
-                    'error': str(e)
+                    'exit_reason': f"{reason}_failed",
+                    'status': 'failed',
+                    'sell_error': str(e),
+                    'sell_attempts': max_retries
                 })
-                self.trade_history.append({**position, 'action': 'sell'})
+                
+                self.trade_history.append({**position, 'action': 'failed_sell'})
                 del self.active_positions[token_address]
-                print(f"⚠️ Sold {token_symbol} (tx sent but error in post-processing: {e})")
-                return {"success": True, "position": position, "warning": str(e)}
-            
-            return {"error": f"Sell execution failed: {str(e)}"}
+                
+                return {"error": f"Sell execution failed after {max_retries} attempts: {str(e)}"}
+    
+    def execute_partial_sell(self, token_address, reason="partial", exit_ratio=0.5, max_retries=3):
+        """Execute partial sell of position with retry logic"""
+        if token_address not in self.active_positions:
+            return {"error": "No active position found"}
         
-        # Post-transaction processing (outside try-catch for transaction sending)
-        try:
-            # Calculate P&L
-            current_price = dexscreener_api.get_price(token_address) or 0
-            entry_price = position['entry_price']
-            pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
-            
-            # Update position
-            position.update({
-                'exit_time': datetime.now(),
-                'exit_price': current_price,
-                'pnl_percent': pnl_percent,
-                'exit_reason': reason,
-                'status': 'closed',
-                'sell_tx_id': sell_tx_id
-            })
-            
-            print(f"✅ Sold {token_symbol}: {pnl_percent:+.2f}% P&L")
-            
-        except Exception as e:
-            # Fallback if price calculation fails
-            position.update({
-                'exit_time': datetime.now(),
-                'exit_price': 0,
-                'pnl_percent': 0,
-                'exit_reason': reason,
-                'status': 'closed',
-                'sell_tx_id': sell_tx_id,
-                'price_error': str(e)
-            })
-            
-            print(f"✅ Sold {token_symbol} (price calculation failed: {e})")
+        position = self.active_positions[token_address]
+        token_symbol = position['token_symbol']
         
-        # Always remove from active positions and add to history if tx was sent
-        self.trade_history.append({**position, 'action': 'sell'})
+        # Record SOL balance before partial sell
+        initial_sol_balance = self.wallet.get_sol_balance()
+        
+        for attempt in range(max_retries):
+            try:
+                # Get current token balance and apply dust reduction
+                full_token_balance = self.wallet.get_token_balance(token_address)
+                if full_token_balance <= 0:
+                    return {"error": "No tokens to sell"}
+                
+                # Apply dust reduction to avoid rounding issues
+                dust_reduction = 0.995 - (attempt * 0.005)  # 99.5%, 99.0%, 98.5%
+                adjusted_balance = int(full_token_balance * dust_reduction)
+                
+                # Calculate partial amount to sell from adjusted balance
+                sell_amount = int(adjusted_balance * exit_ratio)
+                if sell_amount <= 0:
+                    return {"error": "Partial sell amount too small after dust reduction"}
+                
+                token_decimals = position.get('token_decimals', 9)
+                
+                # Fresh quote for partial sell with escalating slippage
+                base_slippage = 50 + (attempt * 50)  # More aggressive for partials
+                # Cap at 500 bps (5%) for micro-caps
+                slippage_bps = min(base_slippage, 500)
+                
+                # Get fresh quote immediately before swap, excluding problematic DEXes
+                exclude_dexes = self.failed_dexes.get(token_address, [])
+                # Simplify routes for partial sells on retries
+                max_accounts = 64 - (attempt * 16) if attempt > 0 else None
+                prefer_direct = attempt >= 2
+                
+                quote = jupiter_api.get_token_to_sol_quote(
+                    token_address, 
+                    sell_amount, 
+                    token_decimals,
+                    slippage_bps=slippage_bps,
+                    dynamic_slippage=True,
+                    exclude_dexes=exclude_dexes if exclude_dexes else None,
+                    max_accounts=max_accounts,
+                    prefer_direct=prefer_direct
+                )
+                
+                if not quote:
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Partial quote failed for {token_symbol}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(1)
+                        continue
+                    return {"error": "Failed to get partial sell quote after retries"}
+                
+                # Execute partial sell with fresh swap transaction
+                swap_tx = jupiter_api.get_swap_transaction(quote, self.wallet.get_address())
+                if not swap_tx:
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Partial swap tx failed for {token_symbol}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(1)
+                        continue
+                    return {"error": "Failed to create partial sell transaction after retries"}
+                
+                # Check quote freshness for partial sells too
+                quote_age_ms = (time.time() * 1000) - quote.get('timeTaken', time.time() * 1000)
+                if quote_age_ms > 2000:  # Quote older than 2 seconds
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Partial quote stale ({quote_age_ms:.0f}ms) for {token_symbol}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(0.5)
+                        continue
+                
+                signed_tx = self.wallet.sign_transaction(swap_tx.get('swapTransaction'))
+                if not signed_tx:
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Partial sign failed for {token_symbol}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(1)
+                        continue
+                    return {"error": "Failed to sign partial sell transaction after retries"}
+                
+                result = self.wallet.send_transaction(signed_tx)
+                if result.get('error'):
+                    error_msg = result.get('error', '')
+                    
+                    # Check for Jupiter-specific transient errors
+                    jupiter_errors = ['6001', '6017', '6024', '0x1771', '0x1781', '0x1788']
+                    is_jupiter_error = any(err_code in str(error_msg) for err_code in jupiter_errors)
+                    is_jupiter_program = 'JUP6' in str(error_msg) or 'Jupiter' in str(error_msg)
+                    
+                    if is_jupiter_error and is_jupiter_program and attempt < max_retries - 1:
+                        print(f"⚠️ Partial Jupiter transient error {error_msg}, re-quoting with higher slippage {attempt + 1}/{max_retries}")
+                        # Break out of current attempt to re-quote with higher slippage
+                        time.sleep(1)
+                        continue
+                    
+                    if attempt < max_retries - 1:
+                        print(f"⚠️ Partial send failed for {token_symbol}: {error_msg}, retry {attempt + 1}/{max_retries}")
+                        time.sleep(2)
+                        continue
+                    return result
+                
+                # Transaction successful
+                sell_tx_id = result.get('tx_id')
+                
+                # Wait and measure actual SOL received
+                time.sleep(3)
+                final_sol_balance = self.wallet.get_sol_balance()
+                actual_sol_received = final_sol_balance - initial_sol_balance
+                
+                # Update position tracking
+                if 'total_sold_ratio' not in position:
+                    position['total_sold_ratio'] = 0.0
+                position['total_sold_ratio'] += exit_ratio
+                
+                # Calculate P&L for this partial sell with resilience
+                def get_partial_exit_price_safe():
+                    return dexscreener_api.get_price(token_address)
+                
+                current_price = api_client.resilient_request(
+                    get_partial_exit_price_safe,
+                    cache_key=f"partial_exit_price_{token_address}"
+                ) or 0
+                
+                entry_price = position['entry_price']
+                price_pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                
+                # Calculate SOL-based P&L for this partial
+                sol_invested_partial = position.get('sol_amount', 0) * exit_ratio
+                sol_pnl_partial = actual_sol_received - sol_invested_partial
+                sol_pnl_percent = (sol_pnl_partial / sol_invested_partial) * 100 if sol_invested_partial > 0 else 0
+                
+                print(f"✅ Partial sold {exit_ratio*100:.0f}% of {token_symbol}: {sol_pnl_percent:+.2f}% SOL P&L")
+                
+                # Log partial sell
+                partial_position = position.copy()
+                partial_position.update({
+                    'partial_exit_time': datetime.now(),
+                    'partial_exit_price': current_price,
+                    'partial_exit_ratio': exit_ratio,
+                    'partial_pnl_percent': price_pnl_percent,
+                    'partial_sol_received': actual_sol_received,
+                    'partial_sol_pnl_percent': sol_pnl_percent,
+                    'partial_exit_reason': reason,
+                    'sell_tx_id': sell_tx_id,
+                    'partial_sell_attempts': attempt + 1
+                })
+                
+                self.trade_history.append({**partial_position, 'action': 'partial_sell'})
+                
+                return {"success": True, "position": partial_position, "partial": True}
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"⚠️ Partial sell attempt {attempt + 1} failed for {token_symbol}: {e}, retrying...")
+                    time.sleep(2)
+                    continue
+                
+                return {"error": f"Partial sell execution failed after {max_retries} attempts: {str(e)}"}
+    
+    def _should_chunk_sell(self, token_balance, position):
+        """Determine if sell should be chunked to reduce price impact"""
+        initial_liquidity = position.get('initial_liquidity', 50000)
+        usd_value = position.get('usd_amount', 10)
+        
+        # Chunk if position is large relative to initial liquidity
+        if usd_value > initial_liquidity * 0.1:  # More than 10% of liquidity
+            chunk_size = max(token_balance // 4, 1)  # Split into 4 chunks
+            return True, chunk_size
+        
+        # Chunk if token balance is very large (heuristic)
+        if token_balance > 1000000:  # More than 1M tokens
+            chunk_size = max(token_balance // 3, 1)  # Split into 3 chunks
+            return True, chunk_size
+        
+        return False, 0
+    
+    def _execute_chunked_sell(self, token_address, reason, chunk_size, max_retries):
+        """Execute sell in chunks to reduce price impact"""
+        if token_address not in self.active_positions:
+            return {"error": "No active position found"}
+        
+        position = self.active_positions[token_address]
+        token_symbol = position['token_symbol']
+        
+        # Record initial SOL balance
+        initial_sol_balance = self.wallet.get_sol_balance()
+        total_sol_received = 0
+        chunks_completed = 0
+        
+        print(f"🔄 Chunked sell starting for {token_symbol}")
+        
+        while True:
+            try:
+                # Get current token balance and apply dust reduction
+                full_token_balance = self.wallet.get_token_balance(token_address)
+                if full_token_balance <= 0:
+                    break
+                
+                # Apply dust reduction for chunks too
+                dust_reduction = 0.995 - (chunks_completed * 0.002)  # Reduce slightly per chunk
+                adjusted_balance = int(full_token_balance * dust_reduction)
+                
+                # Determine chunk size (remaining balance or chunk_size, whichever is smaller)
+                current_chunk = min(chunk_size, adjusted_balance)
+                if current_chunk <= 0:
+                    break
+                
+                token_decimals = position.get('token_decimals', 9)
+                
+                # Get fresh quote for chunk with dynamic slippage, excluding problematic DEXes
+                exclude_dexes = self.failed_dexes.get(token_address, [])
+                # Use simpler routes for chunks to avoid complexity
+                quote = jupiter_api.get_token_to_sol_quote(
+                    token_address, 
+                    current_chunk, 
+                    token_decimals,
+                    slippage_bps=100,  # 1% slippage for chunks
+                    dynamic_slippage=True,
+                    exclude_dexes=exclude_dexes if exclude_dexes else None,
+                    max_accounts=48,  # Limit complexity for chunks
+                    prefer_direct=True  # Prefer direct routes for chunks
+                )
+                
+                if not quote:
+                    print(f"⚠️ Chunk quote failed for {token_symbol}")
+                    break
+                
+                # Check price impact for chunk
+                price_impact = float(quote.get('priceImpactPct', 0))
+                if price_impact > 8.0:  # Still too high impact
+                    print(f"⚠️ Chunk still has high impact {price_impact:.2f}% for {token_symbol}")
+                    # Try smaller chunk
+                    chunk_size = max(chunk_size // 2, 1)
+                    if chunk_size < 100:  # Minimum viable chunk
+                        break
+                    continue
+                
+                # Execute chunk with fresh swap transaction
+                swap_tx = jupiter_api.get_swap_transaction(quote, self.wallet.get_address())
+                if not swap_tx:
+                    print(f"⚠️ Chunk swap tx failed for {token_symbol}")
+                    break
+                
+                # Check quote freshness for chunks
+                quote_age_ms = (time.time() * 1000) - quote.get('timeTaken', time.time() * 1000)
+                if quote_age_ms > 2000:  # Quote older than 2 seconds
+                    print(f"⚠️ Chunk quote stale ({quote_age_ms:.0f}ms) for {token_symbol}, re-quoting")
+                    continue  # Re-quote this chunk
+                
+                signed_tx = self.wallet.sign_transaction(swap_tx.get('swapTransaction'))
+                if not signed_tx:
+                    print(f"⚠️ Chunk sign failed for {token_symbol}")
+                    break
+                
+                chunk_sol_before = self.wallet.get_sol_balance()
+                result = self.wallet.send_transaction(signed_tx)
+                
+                if result.get('error'):
+                    print(f"⚠️ Chunk send failed for {token_symbol}: {result.get('error')}")
+                    break
+                
+                # Wait and measure chunk result
+                time.sleep(2)
+                chunk_sol_after = self.wallet.get_sol_balance()
+                chunk_sol_received = chunk_sol_after - chunk_sol_before
+                total_sol_received += chunk_sol_received
+                chunks_completed += 1
+                
+                print(f"✅ Chunk {chunks_completed} sold {current_chunk} {token_symbol} → {chunk_sol_received:.4f} SOL")
+                
+                # Wait between chunks to avoid rate limits
+                if full_token_balance > current_chunk:  # More chunks remaining
+                    time.sleep(3)
+                
+            except Exception as e:
+                print(f"⚠️ Chunk sell error for {token_symbol}: {e}")
+                break
+        
+        # Final position update
+        final_sol_balance = self.wallet.get_sol_balance()
+        actual_total_received = final_sol_balance - initial_sol_balance
+        
+        # Calculate P&L
+        sol_invested = position.get('sol_amount', 0)
+        sol_pnl = actual_total_received - sol_invested
+        sol_pnl_percent = (sol_pnl / sol_invested) * 100 if sol_invested > 0 else 0
+        
+        # Update position
+        position.update({
+            'exit_time': datetime.now(),
+            'exit_price': 0,  # Can't determine single price for chunked sell
+            'pnl_percent': 0,
+            'actual_sol_received': actual_total_received,
+            'sol_pnl': sol_pnl,
+            'sol_pnl_percent': sol_pnl_percent,
+            'exit_reason': f"{reason}_chunked",
+            'status': 'closed',
+            'chunks_completed': chunks_completed,
+            'chunked_sell': True
+        })
+        
+        print(f"✅ Chunked sell completed for {token_symbol}: {chunks_completed} chunks, {sol_pnl_percent:+.2f}% SOL P&L")
+        
+        # Remove from active positions and add to history
+        self.trade_history.append({**position, 'action': 'chunked_sell'})
         del self.active_positions[token_address]
         
-        return {"success": True, "position": position}
+        return {"success": True, "position": position, "chunked": True}
     
     def get_active_positions(self):
         """Get list of active positions"""
