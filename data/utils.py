@@ -88,7 +88,7 @@ class TokenFilter:
         
         suspicious_terms = ['test', 'fake', 'scam', 'rug', 'honeypot']
         for term in suspicious_terms:
-            if term in symbol or term in name:
+            if term in symbol or (name and term in name):
                 return False
         
         return True

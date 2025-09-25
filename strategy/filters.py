@@ -90,11 +90,25 @@ def get_sniper_candidates():
     print("🔍 Scanning for sniper candidates...")
     
     # Get tokens from multiple sources
-    trending_tokens = dexscreener_api.get_trending_tokens(limit=20) or []  # Max limit is 20
-    # print(f"Discovery: fetched={len(trending_tokens)} before filtering")
+    trending_tokens = dexscreener_api.get_trending_tokens(limit=20) or []
+    new_tokens = get_new_tokens_only() or []
+    high_volume_tokens = get_high_volume_tokens() or []
+    
+    # Combine all sources and deduplicate
+    all_tokens = []
+    seen_addresses = set()
+    
+    # Add from all sources
+    for token_list in [trending_tokens, new_tokens, high_volume_tokens]:
+        for token in token_list:
+            if token.get('address') not in seen_addresses:
+                all_tokens.append(token)
+                seen_addresses.add(token['address'])
+    
+    print(f"Discovery: trending={len(trending_tokens)}, new={len(new_tokens)}, high_vol={len(high_volume_tokens)}, total={len(all_tokens)}")
     
     # Apply main filters
-    candidates = apply_filters(trending_tokens)
+    candidates = apply_filters(all_tokens)
     
     if not candidates:
         print("❌ No candidates found")
@@ -106,21 +120,21 @@ def get_sniper_candidates():
     # Combine and deduplicate, excluding already held positions
     from execution.trade_manager import trade_manager
     final_candidates = []
-    seen_addresses = set()
+    seen_final = set()
     
     # Prioritize momentum candidates
     for token in momentum_candidates:
         token_address = token['address']
-        if token_address not in seen_addresses and token_address not in trade_manager.active_positions:
+        if token_address not in seen_final and token_address not in trade_manager.active_positions:
             final_candidates.append(token)
-            seen_addresses.add(token_address)
+            seen_final.add(token_address)
     
     # Add remaining candidates
     for token in candidates:
         token_address = token['address']
-        if token_address not in seen_addresses and token_address not in trade_manager.active_positions and len(final_candidates) < 5:
+        if token_address not in seen_final and token_address not in trade_manager.active_positions and len(final_candidates) < 5:
             final_candidates.append(token)
-            seen_addresses.add(token_address)
+            seen_final.add(token_address)
     
     print(f"✅ Found {len(final_candidates)} sniper candidates")
     return final_candidates[:5]  # Top 5 candidates

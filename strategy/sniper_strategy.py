@@ -41,8 +41,8 @@ class SniperStrategy:
     def _basic_safety_checks(self, token_data):
         """Basic safety checks for token"""
         
-        # Must have valid metadata
-        if not token_data.get('symbol') or not token_data.get('name'):
+        # Must have valid metadata - only require symbol
+        if not token_data.get('symbol'):
             return False
         
         # Check for obvious scam indicators
@@ -51,7 +51,7 @@ class SniperStrategy:
         
         scam_keywords = ['test', 'fake', 'scam', 'rug', 'honeypot', 'admin']
         for keyword in scam_keywords:
-            if keyword in symbol or keyword in name:
+            if keyword in symbol or (name and keyword in name):
                 return False
         
         # Market cap should be reasonable
@@ -59,13 +59,9 @@ class SniperStrategy:
         if market_cap <= 0 or market_cap > 1000000:  # Over $1M might be too established
             return False
         
-        # Must have recent trading activity
-        last_trade_time = token_data.get('last_trade_ts', 0)
-        if not last_trade_time:
-            return False
-        
-        minutes_since_trade = (time.time() - last_trade_time) / 60
-        if minutes_since_trade > 10:  # More than 10 minutes ago
+        # Check for recent trading activity using volume as proxy
+        volume_24h = token_data.get('volume_24h', 0)
+        if volume_24h <= 0:
             return False
         
         return True
